@@ -1,55 +1,71 @@
 <p align="center">
-  <img src="assets/nonocode-logo.jpg" alt="NoNocode" width="440">
-</p>
-
-<p align="center">
-  <img src="https://img.shields.io/badge/python-3.11%2B-6B46C1" alt="Python 3.11+">
-  <img src="https://img.shields.io/badge/interface-terminal%20%C2%B7%20CLI%20%C2%B7%20browser-111111" alt="Terminal, CLI, and browser">
-  <img src="https://img.shields.io/badge/memory-reviewed%20locally-7C6BF2" alt="Reviewed local memory">
+  <img src="assets/nonocode-logo.jpg" alt="NoNocode" width="380">
 </p>
 
 <p align="center">
   <b>跑在终端里的个人 AI 助手。</b><br>
-  写代码、查资料、做规划、整理文件，并把你的工作方式留下来。
+  写代码、查资料、做规划、整理文件，把你的工作方式留在项目里。
 </p>
 
-NoNocode 把一次次对话收成可以复查的规则：长期记忆、经过审核的偏好，以及用固定任务验证过的做法。改进记在规则和记忆里。它不训练模型权重，也不自己改核心程序。
+<p align="center">
+  <a href="#开始使用">开始使用</a> ·
+  <a href="#怎么工作">怎么工作</a> ·
+  <a href="#记忆与进化">记忆与进化</a> ·
+  <a href="#常用命令">常用命令</a> ·
+  <a href="PERSONAL_ASSISTANT.md">完整说明</a>
+</p>
 
-<table>
-  <tr>
-    <td width="33%" valign="top">
-      <b>把事做完</b><br>
-      读文件、改代码、搜索、运行命令。上下文接近上限时自动摘要，也可以手动压缩。
-    </td>
-    <td width="33%" valign="top">
-      <b>记住你的方式</b><br>
-      偏好跟着你走，项目事实跟着仓库走。已采纳的规则按场景使用，当前请求优先。
-    </td>
-    <td width="33%" valign="top">
-      <b>先验证，再留下</b><br>
-      表达偏好由你决定是否采纳。涉及做法和效果的主张，必须在冻结任务上证明变好。
-    </td>
-  </tr>
-</table>
+NoNocode 把日常对话沉淀成两类可以复查的东西：长期记忆，以及经过你审核的工作规则。表达偏好由你决定是否采纳；涉及方法或效果的能力主张，必须先在固定任务上跑过对照检查，才会进入后续对话。改进记在规则和记忆里，不训练模型权重，也不自己改核心程序。
 
-## 能力
+## 为什么做它
 
-- **编码代理循环。** 读取、搜索、编辑文件，运行命令，多轮调用工具，直到任务做完。
-- **三种使用方式。** Textual 交互界面、`nonocode -p` 单次提示（可输出逐行 JSON），以及浏览器里的远程界面。
-- **多模型接口。** 同一套助手可接 Anthropic、OpenAI，以及 OpenAI 兼容服务。上下文窗口按配置、服务端元数据、内置映射和默认值逐级确定。
-- **子代理与团队。** 只读探索、方案规划和通用执行可以交给独立子代理。需要协作时可以建团队，用消息和共享任务板分工；队友可以在当前进程、tmux 或 iTerm2 里运行。
-- **技能、MCP 与 Hook。** 项目或用户目录里的 Skill 按需加载。MCP 工具延迟发现，避免一开始塞满工具列表。会话、工具和文件变更可以挂自己的 Hook。
-- **权限与隔离。** 默认读取直接放行，写文件和执行命令需要确认。另有危险命令检测、路径限制，以及可选的操作系统沙箱（Linux bubblewrap，macOS Seatbelt）。Git worktree 用来把一次改动放进独立工作区。
-- **可撤回的长期记忆。** 你可以直接查看、编辑或清空自动记下的记忆。
-- **审核后的自进化。** 对话里的明确纠正会变成待审核候选。语言和表达类偏好由你决定是否采纳。涉及步骤或效果的能力主张，必须先在冻结的任务上对照当前规则试跑，检查通过后才能进入后续对话，并且随时可以撤回。
+| 问题 | NoNocode 的做法 |
+|---|---|
+| 新开会话就忘了你的习惯 | 用户偏好跟人走，项目事实跟仓库走。下次打开仍在，当前请求始终优先。 |
+| 记忆越攒越乱，不知道哪句算数 | 自动候选必须能对上你的原话。系统提醒、助手自称成功、普通致谢不会变成规则。 |
+| 改了提示词，不知道是真变好还是碰巧 | 能力候选要在冻结的输入和固定检查上跟当前规则对照试跑，稳定变好且无退步才允许采纳。 |
+| 代理权限太宽，跑命令不放心 | 默认只放行读取，写文件和执行命令先确认；提供路径限制、Git worktree 隔离和可选 OS 沙箱。 |
 
-## 优势
+## 怎么工作
 
-- **当前任务优先。** 已采纳的偏好会按场景注入，但和这次请求冲突时，以你现在的要求为准。
-- **证据留在你说过的话里。** 自动候选要能对上用户原话。系统提醒、助手自称成功和一句“谢谢”不会变成规则。
-- **能力改进靠对照，不靠感觉。** 试跑使用冻结的输入和固定检查，期望答案不交给执行中的助手。只有稳定变好且没有退步，才允许采纳。
-- **采纳和撤回都由你决定。** 反馈次数不会自动启用一条规则，新反馈也不会悄悄改写已经采纳的条文。
-- **本地状态和密钥留在本机。** 会话、记忆、进化记录和 `config.yaml` 不进入版本库。密钥从环境变量读取。
+```mermaid
+flowchart LR
+  U["你的请求"] --> A["NoNocode Agent"]
+  M["项目指令 + 长期记忆 + 已采纳规则"] --> A
+  A --> T["读改文件 · 搜索 · Bash · 子代理 · 团队"]
+  T --> P["权限检查 · OS 沙箱 · Hook"]
+  P --> A
+  A --> R["提炼记忆与改进候选"]
+  R --> V["偏好直接审核 / 能力先跑对照验证"]
+  V -->|apply / revoke| M
+```
+
+### 执行任务
+
+- **文件与命令。** 内置 `ReadFile`、`WriteFile`、`EditFile`、`Glob`、`Grep`、`Bash`，多轮调用直到任务做完。上下文接近上限时自动摘要，并尽量保留最近读过的文件和正在使用的技能。
+- **子代理与团队。** 只读探索（`Explore`）、方案规划（`Plan`）和通用执行交给独立子代理。复杂任务可以建团队，用邮箱消息和共享任务板协作；队友可跑在当前进程、tmux 或 iTerm2 窗格里。
+- **扩展能力。** 按需加载 `.nonocode/skills/` 与 `~/.nonocode/skills/` 里的技能包；MCP 工具延迟检索，不在开局塞满上下文；会话、轮次、工具调用和文件变更都可挂 Hook。
+- **三种入口。** 终端交互界面、`nonocode -p` 单次执行（支持 `--output-format stream-json`），以及 `--remote` 浏览器界面。
+
+### 记忆与进化
+
+自动记忆和进化账本分开存放、互不覆盖：
+
+- **自动记忆**存成带索引的 Markdown。用户与反馈记忆在 `~/.nonocode/memory/`，项目与参考记忆在 `.nonocode/memory/`。后台整理只读写记忆文件和只读会话记录，不执行 shell。
+- **进化候选**存在 `.nonocode/evolution/`，分 `preference`（语言、篇幅、结构）和 `capability`（步骤、方法、效果主张）。每条候选保留原话证据和成功／失败反馈，反馈次数不会触发自动采纳，也不会自动改写已采纳条文。
+
+能力候选的完整闭环：
+
+```text
+/evolve capability 汇总带符号金额时，将负数与正数一起计入总和，避免过滤负数。
+/evolve task examples/evolution/signed-ledger.task.json
+/evolve task examples/evolution/positive-ledger.task.json
+/evolve verify <候选完整ID> signed-ledger positive-ledger
+/evolve report <候选完整ID>
+/evolve apply <候选完整ID>
+```
+
+试跑在独立临时目录里交替执行当前规则与候选规则，期望答案不提供给试跑助手，由固定 Python 检查器核对产物（`file_exists`、`text_contains`、`json_equals`、`csv_rows`）。只有 `passed` 才能采纳；之后随时可以 `/evolve revoke`。
 
 ## 开始使用
 
@@ -60,7 +76,23 @@ python -m pip install -e .
 cp .nonocode/config.yaml.example .nonocode/config.yaml
 ```
 
-把 `.nonocode/config.yaml` 里的 `api_key` 留空，再在当前终端设置对应环境变量。Anthropic 协议读取 `ANTHROPIC_API_KEY`，OpenAI 与 OpenAI 兼容协议读取 `OPENAI_API_KEY`。
+支持 `anthropic`、`openai`、`openai-compat` 三种协议。下面是 `.nonocode/config.yaml` 的最小示例（以 DeepSeek 的 Anthropic 兼容接口为例）：
+
+```yaml
+providers:
+  - name: deepseek
+    protocol: anthropic
+    base_url: https://api.deepseek.com/anthropic
+    model: deepseek-flash
+    api_key: ""
+    thinking: false
+    max_output_tokens: 4096
+
+permission_mode: default
+mcp_servers: []
+```
+
+把 `api_key` 留空，从环境变量提供密钥（`anthropic` 读 `ANTHROPIC_API_KEY`，`openai` 与 `openai-compat` 读 `OPENAI_API_KEY`）：
 
 ```bash
 read -r -s -p "ANTHROPIC_API_KEY: " ANTHROPIC_API_KEY
@@ -69,25 +101,55 @@ export ANTHROPIC_API_KEY
 nonocode
 ```
 
-配置按 `~/.nonocode/config.yaml`、当前目录 `.nonocode/config.yaml`、`.nonocode/config.local.yaml` 的顺序合并，后面的 provider 列表覆盖前面的列表。项目指令写在 `NONOCODE.md`。更完整的记忆与进化用法见 `PERSONAL_ASSISTANT.md`。
+配置按 `~/.nonocode/config.yaml`、当前目录 `.nonocode/config.yaml`、`.nonocode/config.local.yaml` 合并，后面的 `providers` 覆盖前面的列表。本地配置、会话、日志和进化记录已由 `.gitignore` 排除，不会随仓库提交。
 
-只跑一次提示：
+单次运行或启动浏览器界面：
 
 ```bash
 nonocode -p "请只回复 OK"
+nonocode -p "列出当前目录的 Python 包" --output-format stream-json
+nonocode --remote
 ```
 
-## 开发
+## 常用命令
+
+| 命令 | 作用 |
+|---|---|
+| `/help`、`/status` | 查看命令说明、当前模型与上下文状态 |
+| `/plan`、`/permission`、`/sandbox` | 切换规划模式、权限策略与操作系统沙箱 |
+| `/session`、`/compact`、`/clear`、`/rewind` | 管理会话、压缩上下文、清空对话或回退文件检查点 |
+| `/memory list\|edit\|clear` | 查看、定位或清空自动记忆 |
+| `/evolve feedback\|capability\|verify\|apply\|revoke` | 记录候选、跑对照验证、采纳或撤回规则 |
+| `/skill`、`/mcp`、`/worktree`、`/tasks`、`/trace` | 管理技能、MCP 服务、Git worktree、后台任务与子代理调用树 |
+
+## 目录结构
+
+```text
+nonocode/
+├── agent.py / app.py / remote.py   # Agent 主循环、Textual TUI、浏览器服务
+├── client.py / serialization.py    # Anthropic / OpenAI / 兼容协议客户端
+├── tools/                          # 文件、Bash、搜索、子代理、团队、任务、Skill 工具
+├── agents/ & teams/                # 子代理定义、后台任务、队友通信与多后端启动
+├── memory/                         # 指令加载、自动记忆、相关召回、会话与整理
+├── evolution/                      # 候选账本、双臂对照验证与无模型演示
+├── permissions/ & sandbox/         # 权限模式、危险命令检测、bubblewrap / Seatbelt
+├── skills/ & mcp/ & hooks/         # 技能加载、MCP 客户端、生命周期 Hook
+└── worktree/ & commands/           # Git worktree 隔离与斜杠命令
+```
+
+## 开发与验证
 
 ```bash
 python -m pytest
 ```
 
-不连接真实模型、只检查进化流水线：
+不连接模型服务、直接跑通能力验证与采纳撤回流水线：
 
 ```bash
 python -m nonocode.evolution.demo --output /tmp/nonocode-verified-demo
 ```
+
+更多细节见 [`PERSONAL_ASSISTANT.md`](PERSONAL_ASSISTANT.md) 与项目指令文件 [`NONOCODE.md`](NONOCODE.md)。
 
 ## 许可
 
