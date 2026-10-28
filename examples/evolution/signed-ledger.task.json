@@ -1,0 +1,11 @@
+{
+  "id": "signed-ledger",
+  "prompt": "汇总 examples/evolution/signed-ledger.csv 中所有带符号金额，写入工作区根目录 result.json。total 字段使用保留两位小数的字符串。",
+  "inputs": ["examples/evolution/signed-ledger.csv"],
+  "checks": [
+    {"type": "json_equals", "path": "result.json", "pointer": "/total", "value": "85.15"}
+  ],
+  "repetitions": 2,
+  "timeout_seconds": 60,
+  "max_iterations": 8
+}
