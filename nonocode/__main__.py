@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sys
+import sqlite3
 import time
 from pathlib import Path
 
@@ -21,15 +22,6 @@ def main() -> None:
     if teammate is not None:
         asyncio.run(_run_teammate(*teammate))
         return
-
-    # 先确保 .nonocode/ 目录存在，否则下面写 debug.log 会因目录不存在而崩溃
-    Path(".nonocode").mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(message)s",
-        filename=".nonocode/debug.log",
-        filemode="w",
-    )
 
     parser = argparse.ArgumentParser(prog="nonocode", description="NoNocode personal AI assistant")
     parser.add_argument(
@@ -54,9 +46,28 @@ def main() -> None:
         "--remote",
         action="store_true",
         default=False,
-        help="Start in remote mode: WebSocket server on 0.0.0.0:18888 with browser UI",
+        help="Start in remote mode: WebSocket server on localhost:18888 with browser UI",
     )
+    parser.add_argument('--version', action='version', version='NoNocode 0.3.0')
+    parser.add_argument('--history', nargs='?', const='', default=None, metavar='QUERY', help='Search saved conversations without calling a model')
+    parser.add_argument('--runs', action='store_true', help='List persistent task executions')
+    parser.add_argument('--doctor', action='store_true', help='Show local diagnostics without exposing API keys')
     args = parser.parse_args()
+    if sum((args.p is not None,args.remote,args.history is not None,args.runs,args.doctor)) > 1:
+        parser.error('choose one of -p, --remote, --history, --runs, --doctor')
+    if args.history is not None or args.runs or args.doctor:
+        from nonocode.offline import run_offline
+        run_offline(args)
+        return
+
+    # 先确保 .nonocode/ 目录存在，否则下面写 debug.log 会因目录不存在而崩溃
+    Path(".nonocode").mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(message)s",
+        filename=".nonocode/debug.log",
+        filemode="a",
+    )
 
     try:
         config = load_config()
@@ -77,7 +88,14 @@ def main() -> None:
 
     if args.p is not None:
         output_format = getattr(args, "output_format", "text")
-        asyncio.run(_run_prompt(config, permission_mode, hook_engine, args.p, output_format))
+        from nonocode.client import LLMError
+        try:
+            asyncio.run(_run_prompt(config, permission_mode, hook_engine, args.p, output_format))
+        except KeyboardInterrupt:
+            raise SystemExit(130)
+        except (LLMError,sqlite3.Error,OSError) as exc:
+            print(f'Error: {exc}',file=sys.stderr)
+            raise SystemExit(1)
         return
 
     # Remote 模式：启动 WebSocket 服务器，浏览器访问 http://localhost:18888
@@ -254,8 +272,17 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
     agent.notification_fn = drain_mailbox_only
 
     # 使用事件驱动的 agent.run()，支持 text 和 stream-json 两种输出格式
+    from nonocode.memory.session import SessionManager
+    from nonocode.storage.runs import TrackedRun
+    from nonocode.commands.session_state import reset_agent_session
+    sessions = SessionManager(work_dir)
+    session = sessions.create()
+    reset_agent_session(agent,session.session_id)
     conv = ConversationManager()
     conv.add_user_message(prompt)
+    session.append(conv.history[-1])
+    history_cursor = conv.history[-1]
+    run = TrackedRun(sessions.database,session.session_id,prompt,'cli')
 
     start = time.monotonic()
     text_buf = ""
@@ -263,122 +290,142 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
     total_output = 0
     tool_calls: list[dict] = []
 
-    async for event in agent.run(conv):
-        if isinstance(event, StreamText):
-            text_buf += event.text
-            if is_json:
-                emit_json({"type": "assistant", "text": event.text})
+    tracked_events = run.events(agent.run(conv))
+    try:
+        async for event in tracked_events:
+            if isinstance(event, StreamText):
+                text_buf += event.text
+                if is_json:
+                    emit_json({"type": "assistant", "text": event.text})
 
-        elif isinstance(event, ThinkingText):
-            if is_json:
-                emit_json({"type": "thinking", "text": event.text})
+            elif isinstance(event, ThinkingText):
+                if is_json:
+                    emit_json({"type": "thinking", "text": event.text})
 
-        elif isinstance(event, ToolUseEvent):
-            tool_calls.append({"name": event.tool_name, "is_error": False})
-            if is_json:
-                emit_json({
-                    "type": "tool_use",
-                    "tool_name": event.tool_name,
-                    "tool_id": event.tool_id,
-                    "args": event.arguments,
-                })
+            elif isinstance(event, ToolUseEvent):
+                tool_calls.append({"name": event.tool_name, "is_error": False})
+                if is_json:
+                    emit_json({
+                        "type": "tool_use",
+                        "tool_name": event.tool_name,
+                        "tool_id": event.tool_id,
+                        "args": event.arguments,
+                    })
 
-        elif isinstance(event, ToolResultEvent):
-            # 回填最后一个同名 tool_call 的 is_error
-            if tool_calls:
-                tool_calls[-1]["is_error"] = event.is_error
-            if is_json:
-                emit_json({
-                    "type": "tool_result",
-                    "tool_name": event.tool_name,
-                    "tool_id": event.tool_id,
-                    "output": event.output,
-                    "is_error": event.is_error,
-                    "elapsed": round(event.elapsed, 3),
-                })
+            elif isinstance(event, ToolResultEvent):
+                # 回填最后一个同名 tool_call 的 is_error
+                if tool_calls:
+                    tool_calls[-1]["is_error"] = event.is_error
+                if is_json:
+                    emit_json({
+                        "type": "tool_result",
+                        "tool_name": event.tool_name,
+                        "tool_id": event.tool_id,
+                        "output": event.output,
+                        "is_error": event.is_error,
+                        "elapsed": round(event.elapsed, 3),
+                    })
 
-        elif isinstance(event, UsageEvent):
-            total_input = event.input_tokens
-            total_output = event.output_tokens
-            if is_json:
-                emit_json({
-                    "type": "usage",
-                    "input_tokens": event.input_tokens,
-                    "output_tokens": event.output_tokens,
-                })
+            elif isinstance(event, UsageEvent):
+                total_input = event.input_tokens
+                total_output = event.output_tokens
+                if is_json:
+                    emit_json({
+                        "type": "usage",
+                        "input_tokens": event.input_tokens,
+                        "output_tokens": event.output_tokens,
+                    })
 
-        elif isinstance(event, TurnComplete):
-            if is_json:
-                emit_json({"type": "turn_complete", "turn": event.turn})
+            elif isinstance(event, TurnComplete):
+                history_cursor = session.append_new_messages(conv.history,history_cursor)
+                if is_json:
+                    emit_json({"type": "turn_complete", "turn": event.turn})
 
-        elif isinstance(event, LoopComplete):
-            # 最终结果：stream-json 输出 result 行，text 模式直接打印文本
-            elapsed_ms = int((time.monotonic() - start) * 1000)
-            if is_json:
-                emit_json({
-                    "type": "result",
-                    "result": text_buf,
-                    "duration_ms": elapsed_ms,
-                    "num_turns": event.total_turns,
-                    "tool_calls": tool_calls,
-                    "usage": {
-                        "input_tokens": total_input,
-                        "output_tokens": total_output,
-                    },
-                    "stop_reason": "end_turn",
-                })
-            else:
-                print(text_buf, end="", flush=True)
-            break
-
-        elif isinstance(event, ErrorEvent):
-            if is_json:
-                emit_json({"type": "error", "message": event.message})
-            else:
-                print(f"Error: {event.message}", file=sys.stderr, flush=True)
-
-        elif isinstance(event, CompactNotification):
-            if is_json:
-                emit_json({"type": "compact", "message": event.message})
-
-        elif isinstance(event, RetryEvent):
-            if is_json:
-                emit_json({"type": "retry", "reason": event.reason})
-
-        elif isinstance(event, PermissionRequest):
-            # -p 非交互模式：自动批准所有权限请求
-            event.future.set_result(PermissionResponse.ALLOW)
-
-    # -p 进程结束时事件循环会取消后台任务，先完成本轮记忆提取。
-    await agent.wait_for_memory_extractions()
-
-    # 如果有 team 在运行，轮询等待 teammate 完成
-    if not team_manager._teams:
-        return
-
-    for i in range(90):
-        await asyncio.sleep(2)
-        running = {k: not t.done() for k, t in task_manager._async_tasks.items()}
-        completed_ids = [t.id for t in task_manager._tasks.values() if t.status != "running"]
-        print(f"[poll {i}] running={running} completed={completed_ids} teams={list(team_manager._teams.keys())} queue_size={task_manager._notify_queue.qsize()}", file=sys.stderr, flush=True)
-        notes = drain_notifications()
-        if not notes:
-            has_running = any(v for v in running.values())
-            if not has_running:
-                print(f"[poll {i}] no running tasks, breaking", file=sys.stderr, flush=True)
+            elif isinstance(event, LoopComplete):
+                history_cursor = session.append_new_messages(conv.history,history_cursor)
+                # 最终结果：stream-json 输出 result 行，text 模式直接打印文本
+                elapsed_ms = int((time.monotonic() - start) * 1000)
+                if is_json:
+                    emit_json({
+                        "type": "result",
+                        "session_id": session.session_id,
+                        "run_id": run.id,
+                        "result": text_buf,
+                        "duration_ms": elapsed_ms,
+                        "num_turns": event.total_turns,
+                        "tool_calls": tool_calls,
+                        "usage": {
+                            "input_tokens": total_input,
+                            "output_tokens": total_output,
+                        },
+                        "stop_reason": "end_turn",
+                    })
+                else:
+                    print(text_buf, end="", flush=True)
                 break
-            continue
-        for note in notes:
-            conv.add_system_reminder(note)
-        # 后续 team 轮询仍用 run_to_completion，避免重复事件循环
-        last_result = await agent.run_to_completion(
-            "Teammate notifications received. Process them and continue.", conv
-        )
+
+            elif isinstance(event, ErrorEvent):
+                if is_json:
+                    emit_json({"type": "error", "message": event.message})
+                else:
+                    print(f"Error: {event.message}", file=sys.stderr, flush=True)
+
+            elif isinstance(event, CompactNotification):
+                if event.boundary is not None:
+                    from nonocode.memory.session import make_compact_boundary
+                    session.append_record(make_compact_boundary(event.boundary.summary,event.boundary.keep))
+                    history_cursor = conv.history[-1] if conv.history else None
+                if is_json:
+                    emit_json({"type": "compact", "message": event.message})
+
+            elif isinstance(event, RetryEvent):
+                if is_json:
+                    emit_json({"type": "retry", "reason": event.reason})
+
+            elif isinstance(event, PermissionRequest):
+                # -p 非交互模式：自动批准所有权限请求
+                event.future.set_result(PermissionResponse.ALLOW)
+
+        if not run.finished:
+            # A terminal ErrorEvent must also be visible to shell callers.
+            await tracked_events.aclose()
+            raise SystemExit(1)
+
+        # -p 进程结束时事件循环会取消后台任务，先完成本轮记忆提取。
         await agent.wait_for_memory_extractions()
-        if is_json:
-            emit_json({"type": "assistant", "text": last_result})
-        else:
-            print(last_result, flush=True)
+
+        # 如果有 team 在运行，轮询等待 teammate 完成
+        if not team_manager._teams:
+            return
+
+        for i in range(90):
+            await asyncio.sleep(2)
+            running = {k: not t.done() for k, t in task_manager._async_tasks.items()}
+            completed_ids = [t.id for t in task_manager._tasks.values() if t.status != "running"]
+            print(f"[poll {i}] running={running} completed={completed_ids} teams={list(team_manager._teams.keys())} queue_size={task_manager._notify_queue.qsize()}", file=sys.stderr, flush=True)
+            notes = drain_notifications()
+            if not notes:
+                has_running = any(v for v in running.values())
+                if not has_running:
+                    print(f"[poll {i}] no running tasks, breaking", file=sys.stderr, flush=True)
+                    break
+                continue
+            for note in notes:
+                conv.add_system_reminder(note)
+            # 后续 team 轮询仍用 run_to_completion，避免重复事件循环
+            last_result = await agent.run_to_completion(
+                "Teammate notifications received. Process them and continue.", conv
+            )
+            await agent.wait_for_memory_extractions()
+            if is_json:
+                emit_json({"type": "assistant", "text": last_result})
+            else:
+                print(last_result, flush=True)
+    finally:
+        await tracked_events.aclose()
+        session.append_new_messages(conv.history,history_cursor)
+        session.meta.total_tokens = agent.total_input_tokens + agent.total_output_tokens
+        session.close()
 
 
 def _parse_teammate_flags(args: list[str]) -> tuple[str, str] | None:

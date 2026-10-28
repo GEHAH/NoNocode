@@ -11,14 +11,17 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 from typing import Any
 
 import websockets
 from websockets.asyncio.server import Server as WSServer, ServerConnection
 from websockets.http11 import Request, Response
 
+from nonocode.storage.runs import TrackedRun
 from nonocode.agent import (
     Agent,
     CompactNotification,
@@ -70,7 +73,7 @@ class RemoteServer:
         providers: list[ProviderConfig],
         mcp_servers: list[MCPServerConfig] | None = None,
         hook_engine: HookEngine | None = None,
-        addr: str = "0.0.0.0",
+        addr: str = "127.0.0.1",
         port: int = 18888,
         config: object | None = None,
     ) -> None:
@@ -90,6 +93,8 @@ class RemoteServer:
         self.registry: ToolRegistry | None = None
         self.session_id: str = ""
         self._streaming = False
+        self._current_run_id: str | None = None
+        self._session_token_offset = 0
         self._cancel_event: asyncio.Event | None = None
         self._agent_task: asyncio.Task | None = None
 
@@ -148,6 +153,13 @@ class RemoteServer:
         """拦截 HTTP 请求，对 / 路径返回 HTML 页面。
         返回 None 表示继续走 WebSocket 升级流程。
         """
+        if request.path == '/ws':
+            origin = request.headers.get('Origin')
+            host = request.headers.get('Host', '')
+            if origin and (urlsplit(origin).scheme not in {'http','https'} or urlsplit(origin).netloc.lower() != host.lower()):
+                return Response(403,'Forbidden',websockets.Headers(),b'Cross-origin WebSocket denied')
+            if self.addr in {'127.0.0.1','localhost','::1'} and urlsplit('//'+host).hostname not in {'127.0.0.1','localhost','::1'}:
+                return Response(403,'Forbidden',websockets.Headers(),b'Invalid local host')
         if request.path == "/":
             return Response(
                 200,
@@ -190,11 +202,21 @@ class RemoteServer:
                 except json.JSONDecodeError:
                     continue
 
+                if not isinstance(msg,dict):
+                    continue
                 msg_type = msg.get("type", "")
                 data = msg.get("data", {})
+                if not isinstance(data,dict):
+                    continue
+                if msg_type == 'product_request':
+                    await self._handle_product_request(websocket,data)
+                    continue
 
                 if msg_type == "user_message":
-                    content = data.get("content", "").strip()
+                    content = data.get("content", "")
+                    if not isinstance(content,str):
+                        continue
+                    content = content.strip()
                     if content:
                         # 在后台任务中处理，不阻塞 WebSocket 读循环
                         asyncio.create_task(self._handle_user_message(content))
@@ -216,6 +238,70 @@ class RemoteServer:
             pass
         finally:
             self._connections.discard(websocket)
+
+    async def _handle_product_request(self, websocket: ServerConnection, data: dict) -> None:
+        from nonocode.product import ProductService
+        from nonocode.storage.database import now
+        request_id = data.get('request_id','')
+        response = {'request_id':request_id,'ok':False}
+        try:
+            product = ProductService(self.session_manager,self.memory_manager)
+            action = data.get('action','')
+            if not isinstance(action,str):
+                raise ValueError('无效操作')
+            if self._streaming and action in {'memory_save','memory_forget','session_resume','session_rename'}:
+                raise ValueError('请等待或取消当前任务后再修改')
+            def string(key, default=''):
+                value = data.get(key,default)
+                if not isinstance(value,str):
+                    raise ValueError('字段 '+key+' 必须是文本')
+                return value
+            if action == 'history':
+                result = await asyncio.to_thread(product.history,string('query'))
+            elif action == 'runs':
+                result = await asyncio.to_thread(product.database.list_runs)
+            elif action == 'run':
+                result = await asyncio.to_thread(product.database.get_run,string('id'))
+                if result is None:
+                    raise ValueError('任务不存在')
+            elif action == 'memories':
+                result = await asyncio.to_thread(product.memory_entries,string('query'))
+            elif action == 'memory_save':
+                result = await asyncio.to_thread(product.update_memory,string('scope'),string('name'),string('body'),create=data.get('create') is True)
+            elif action == 'memory_forget':
+                await asyncio.to_thread(product.forget_memory,string('scope'),string('name'))
+                result = {'message':'记忆已删除'}
+            elif action == 'session_resume':
+                session_id = string('id')
+                if not self.session_manager._valid_id(session_id) or self.session_manager.database.session_metadata(session_id) is None:
+                    raise ValueError('会话不存在')
+                await self._handle_slash_command('/session resume '+session_id)
+                result = {'message':'会话已恢复；请输入下一步，不会自动重放工具'}
+            elif action == 'session_rename':
+                session_id,title = string('id'),string('title')
+                await asyncio.to_thread(self.session_manager.rename,session_id,title)
+                if self.session and self.session.session_id == session_id:
+                    self.session.meta.title = title.strip()
+                result = {'message':'会话已重命名'}
+            elif action == 'session_export':
+                session_id = string('id')
+                result = {'id':session_id,'text':await asyncio.to_thread(self.session_manager.export,session_id)}
+            elif action == 'run_cancel':
+                if not self.cancel_run(string('id')):
+                    raise ValueError('任务已结束或不属于当前实例')
+                result = {'message':'已请求取消任务'}
+            elif action == 'backup':
+                destination = product.database.path.parent / 'backups' / ('nonocode-'+now().replace(':','-')+'.db')
+                result = {'path':str(await asyncio.to_thread(product.database.backup,destination))}
+            else:
+                raise ValueError('未知操作')
+            response.update(ok=True,result=result)
+        except (ValueError,OSError) as exc:
+            response['error'] = str(exc)
+        except Exception:
+            log.exception('Product request failed')
+            response['error'] = '操作失败，请查看本机日志'
+        await websocket.send(json.dumps({'type':'product_result','data':response},ensure_ascii=False))
 
     # ------------------------------------------------------------------
     # Agent 初始化（复刻 TUI 的 _select_provider 流程）
@@ -401,8 +487,23 @@ class RemoteServer:
     # ------------------------------------------------------------------
 
     async def _handle_user_message(self, content: str) -> None:
+        try:
+            await self._handle_user_message_impl(content)
+        except (sqlite3.Error,OSError) as exc:
+            log.exception('Local persistence failed')
+            self._streaming = False
+            self._current_run_id = None
+            self._agent_task = None
+            self._cancel_event = None
+            for future in self._pending_perms.values():
+                if not future.done():
+                    future.cancel()
+            self._pending_perms.clear()
+            await self._broadcast({'type':'error','data':{'message':f'本地记录保存失败: {exc}'}})
+
+    async def _handle_user_message_impl(self, content: str) -> None:
         """处理来自 Web UI 的用户消息或斜杠命令。"""
-        if self._streaming:
+        if self._streaming and not content.startswith('/'):
             return
 
         # 斜杠命令
@@ -431,8 +532,12 @@ class RemoteServer:
         start_time = time.monotonic()
         stream_buf = ""
 
+        run = TrackedRun(self.session_manager.database, self.session_id, content, 'remote',
+                         input_offset=self.agent.total_input_tokens, output_offset=self.agent.total_output_tokens)
+        self._current_run_id = run.id
+        tracked_events = run.events(self.agent.run(self.conversation))
         try:
-            async for event in self.agent.run(self.conversation):
+            async for event in tracked_events:
                 # 检查取消信号
                 if self._cancel_event.is_set():
                     break
@@ -568,23 +673,27 @@ class RemoteServer:
                     })
 
         except asyncio.CancelledError:
+            run.finish('cancelled','用户取消了本次执行')
             await self._broadcast({
                 "type": "error",
                 "data": {"message": "Operation cancelled"},
             })
         except Exception as exc:
+            run.finish('failed',str(exc))
             log.exception("Agent run error")
             await self._broadcast({
                 "type": "error",
                 "data": {"message": str(exc)},
             })
         finally:
+            await tracked_events.aclose()
             self._persist_messages(history_cursor)
             if self.session:
-                self.session.meta.total_tokens = self.agent.total_input_tokens + self.agent.total_output_tokens
+                self.session.meta.total_tokens = self._session_token_offset + self.agent.total_input_tokens + self.agent.total_output_tokens
                 self.session.meta.save(
                     self.session._sessions_dir / f"{self.session.session_id}.meta"
                 )
+            self._current_run_id = None
             self._streaming = False
             self._cancel_event = None
             self._agent_task = None
@@ -592,6 +701,12 @@ class RemoteServer:
                 if not future.done():
                     future.cancel()
             self._pending_perms.clear()
+
+    def cancel_run(self, run_id: str) -> bool:
+        if run_id != self._current_run_id or self._agent_task is None or self._agent_task.done():
+            return False
+        self._agent_task.cancel()
+        return True
 
     def _persist_messages(self, cursor: Message | None) -> Message | None:
         if self.session is not None and self.conversation is not None:
@@ -615,6 +730,12 @@ class RemoteServer:
                 "data": {"message": f"Unknown command: /{name} — type /help to see available commands"},
             })
             await self._broadcast({"type": "command_done", "data": None})
+            return
+
+        from nonocode.commands.registry import requires_idle
+        if self._streaming and requires_idle(cmd,args):
+            await self._broadcast({'type':'system','data':{'message':'请等待或取消当前任务后再执行此操作'}})
+            await self._broadcast({'type':'command_done','data':None})
             return
 
         # 需要参数但没给
@@ -692,6 +813,7 @@ class RemoteServer:
         )
 
     def _set_session(self, session: Session) -> None:
+        self._session_token_offset = session.meta.total_tokens
         self.session = session
         self.session_id = session.session_id
         if self.agent:

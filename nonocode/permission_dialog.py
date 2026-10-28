@@ -33,15 +33,17 @@ class InlinePermissionWidget(Vertical, can_focus=True):
     class Responded(Message):
 
 
-        def __init__(self, response: PermissionResponse) -> None:
+        def __init__(self, response: PermissionResponse, widget: InlinePermissionWidget) -> None:
             super().__init__()
             self.response = response
+            self.widget = widget
 
     def __init__(self, tool_name: str, description: str, **kwargs) -> None:
         super().__init__(id="perm-inline", **kwargs)
         self._tool_name = tool_name
         self._description = description
         self._cursor = 0
+        self._responded = False
 
     def compose(self) -> ComposeResult:
         yield Static(self._build_content(), id="perm-content")
@@ -82,8 +84,13 @@ class InlinePermissionWidget(Vertical, can_focus=True):
 
     def action_select(self) -> None:
         _, response = _PERM_OPTIONS[self._cursor]
-        self.post_message(self.Responded(response))
+        self._respond(response)
 
 
     def action_deny(self) -> None:
-        self.post_message(self.Responded(PermissionResponse.DENY))
+        self._respond(PermissionResponse.DENY)
+
+    def _respond(self, response: PermissionResponse) -> None:
+        if not self._responded:
+            self._responded = True
+            self.post_message(self.Responded(response, self))

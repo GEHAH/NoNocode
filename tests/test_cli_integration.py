@@ -107,3 +107,36 @@ def test_cli_real_sdk_stream_and_file_tool(tmp_path, local_anthropic, output_for
         assert any(e['type'] == 'tool_result' and not e['is_error'] for e in events)
         assert events[-1]['type'] == 'result'
         assert events[-1]['result'] == 'CLI_OK'
+
+
+def test_cli_offline_history_and_doctor_without_api_configuration(tmp_path):
+    history = run_cli(tmp_path,['--history','中文'])
+    assert history.returncode == 0,history.stderr
+    assert json.loads(history.stdout) == []
+    runs = run_cli(tmp_path,['--runs'])
+    assert runs.returncode == 0 and json.loads(runs.stdout) == []
+    doctor = run_cli(tmp_path,['--doctor'])
+    assert doctor.returncode == 0,doctor.stderr
+    result = json.loads(doctor.stdout)
+    assert result['version'] == '0.3.0'
+    assert 'configuration' in result
+    version = run_cli(tmp_path,['--version'])
+    assert version.returncode == 0 and version.stdout.strip() == 'NoNocode 0.3.0'
+
+
+def test_cli_saves_history_and_task_for_later_offline_lookup(tmp_path, local_anthropic):
+    base_url,_ = local_anthropic
+    directory = tmp_path/'.nonocode'
+    directory.mkdir()
+    (directory/'config.yaml').write_text(yaml.safe_dump({'providers':[
+        {'name':'audit','protocol':'anthropic','model':'audit','base_url':base_url,
+         'api_key':'fake-local-only','context_window':128000,'thinking':False}]}))
+    (tmp_path/'input.txt').write_text('persisted-cli-input')
+    result = run_cli(tmp_path,['-p','Read input.txt','--output-format','stream-json'])
+    assert result.returncode == 0,result.stderr
+    final = [json.loads(line) for line in result.stdout.splitlines()][-1]
+    assert final['run_id'] and final['session_id']
+    history = run_cli(tmp_path,['--history','persisted-cli-input'])
+    assert json.loads(history.stdout)[0]['session_id'] == final['session_id']
+    runs = json.loads(run_cli(tmp_path,['--runs']).stdout)
+    assert runs[0]['id'] == final['run_id'] and runs[0]['status'] == 'completed'

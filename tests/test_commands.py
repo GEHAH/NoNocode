@@ -451,7 +451,7 @@ class TestRegisterAllCommands:
         expected = {
             "help", "compact", "clear", "plan",
             "session", "mcp", "memory", "permission",
-            "sandbox", "rewind", "status", "skill", "evolve",
+            "sandbox", "rewind", "status", "skill", "history", "runs", "storage", "evolve",
         }
         assert names == expected
 

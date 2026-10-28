@@ -98,3 +98,14 @@ class CommandRegistry:
 
     def list_commands(self) -> list[Command]:
         return [cmd for cmd in self._commands.values() if not cmd.hidden]
+
+
+def requires_idle(command: Command, args: str) -> bool:
+    """Read-only management commands stay available during execution."""
+    if command.type == CommandType.PROMPT or command.name in {'clear','compact','plan'}:
+        return True
+    sub = args.split(maxsplit=1)[0] if args.strip() else ''
+    return (command.name == 'session' and sub in {'new','resume','delete','rename'}
+            or command.name == 'memory' and sub in {'clear','update','add','forget'}
+            or command.name == 'rewind' and bool(args.strip())
+            or command.name in {'permission','sandbox','skill'} and bool(args.strip()))

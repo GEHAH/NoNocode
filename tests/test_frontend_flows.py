@@ -113,7 +113,8 @@ async def test_tui_new_resume_and_local_commands(tmp_path, monkeypatch, provider
         old_history = app.agent.file_history
         app.agent.active_skills["old-skill"] = "old skill body"
         for command in ("/help", "/status", "/session list", "/memory list",
-                        "/evolve status", "/permission", "/mcp", "/skill list", "/sandbox"):
+                        "/evolve status", "/permission", "/mcp", "/skill list", "/sandbox",
+                        "/history Original", "/runs", "/storage"):
             await app._dispatch_command(command)
         await app._dispatch_command("/session new")
         assert app.session.session_id != old_id
@@ -233,6 +234,7 @@ async def test_remote_http_websocket_chat_and_cancel(remote):
             assert messages[-1]['data']['message'] == 'Operation cancelled'
             assert not remote._streaming
             assert remote._pending_perms == {}
+            assert remote.session_manager.database.list_runs()[0]['status'] == 'cancelled'
 
 
 @pytest.mark.asyncio
@@ -287,3 +289,104 @@ async def test_remote_manual_compact_survives_resume(remote):
         assert not any(message.content == 'Before compaction' for message in resumed.messages)
     finally:
         resumed.session.close()
+
+
+@pytest.mark.asyncio
+async def test_product_panels_history_runs_memory_and_export(remote):
+    import json
+    from types import SimpleNamespace
+    await remote._handle_user_message('Searchable history 中国研究')
+    original = remote.session_id
+    websocket = SimpleNamespace(send=AsyncMock())
+
+    async def request(action, **fields):
+        await remote._handle_product_request(websocket,{'request_id':'request-1','action':action,**fields})
+        reply = json.loads(websocket.send.call_args.args[0])
+        assert reply['type'] == 'product_result'
+        assert reply['data']['request_id'] == 'request-1'
+        assert reply['data']['ok'],reply
+        return reply['data']['result']
+
+    remote._broadcast.reset_mock()
+    assert (await request('history',query='中国'))[0]['session_id'] == original
+    runs = await request('runs')
+    assert runs[0]['status'] == 'completed' and runs[0]['source'] == 'remote'
+    assert (await request('run',id=runs[0]['id']))['steps'] == []
+    assert 'Searchable history' in (await request('session_export',id=original))['text']
+    await request('session_rename',id=original,title='Renamed session')
+    assert remote.session.meta.title == 'Renamed session'
+    await request('memory_save',scope='project',name='language',body='请使用中文',create=True)
+    assert (await request('memories',query='中文'))[0]['name'] == 'language'
+    await request('memory_save',scope='project',name='language',body='Use concise answers')
+    assert await request('memories',query='中文') == []
+    await request('memory_forget',scope='project',name='language')
+    assert await request('memories') == []
+    backup = await request('backup')
+    from pathlib import Path
+    assert Path(backup['path']).is_file()
+    # Queries and edits are returned to their requesting socket, never broadcast as chat.
+    remote._broadcast.assert_not_awaited()
+    await remote._handle_slash_command('/session new')
+    await request('session_resume',id=original)
+    assert remote.session_id == original
+    await remote._handle_user_message('After resume')
+    assert remote.session.meta.total_tokens == 24
+
+
+@pytest.mark.asyncio
+async def test_product_mutations_reject_busy_and_invalid_memory_paths(remote):
+    import json
+    from types import SimpleNamespace
+    websocket = SimpleNamespace(send=AsyncMock())
+    for fields in ({'action':'memory_save','scope':'project','name':'../outside','body':'x','create':True},
+                   {'action':'memory_save','scope':'project','name':'safe','body':42,'create':True},
+                   {'action':'run','id':'unknown'}):
+        await remote._handle_product_request(websocket,fields)
+        assert not json.loads(websocket.send.call_args.args[0])['data']['ok']
+    remote._streaming = True
+    try:
+        await remote._handle_product_request(websocket,{'action':'memory_forget','scope':'project','name':'safe'})
+        assert '当前任务' in json.loads(websocket.send.call_args.args[0])['data']['error']
+    finally:
+        remote._streaming = False
+
+
+@pytest.mark.asyncio
+async def test_remote_rejects_cross_origin_websocket(remote):
+    import websockets
+    from websockets.exceptions import InvalidStatus
+    async with websockets.serve(remote._ws_handler,'127.0.0.1',0,
+                                process_request=remote._process_http_request) as listener:
+        port = listener.sockets[0].getsockname()[1]
+        with pytest.raises(InvalidStatus) as error:
+            async with websockets.connect(f'ws://127.0.0.1:{port}/ws',origin='https://unrelated.example'):
+                pass
+        assert error.value.response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_busy_commands_do_not_replace_active_session(remote):
+    old_id = remote.session_id
+    remote._streaming = True
+    try:
+        await remote._handle_slash_command('/clear')
+        await remote._handle_slash_command('/session new')
+        assert remote.session_id == old_id
+        await remote._handle_slash_command('/history')
+    finally:
+        remote._streaming = False
+
+
+@pytest.mark.asyncio
+async def test_remote_database_failure_is_visible_and_unblocks_next_message(remote,monkeypatch):
+    import sqlite3
+    def failed_write(*args):
+        raise sqlite3.OperationalError('simulated disk failure')
+    with monkeypatch.context() as patcher:
+        patcher.setattr(remote.session_manager.database,'append_records',failed_write)
+        await remote._handle_user_message('Fail to save')
+    assert not remote._streaming
+    assert any(call.args[0]['type']=='error' and 'simulated disk failure' in str(call.args[0])
+               for call in remote._broadcast.call_args_list)
+    await remote._handle_user_message('Next message')
+    assert remote.conversation.history[-1].content == 'Test reply'

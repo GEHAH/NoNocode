@@ -190,6 +190,25 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
 .msg-assistant .content th, .msg-assistant .content td {
   border: 1px solid var(--border); padding: 6px 12px; text-align: left; }
 .msg-assistant .content th { background: var(--bg-surface); }
+
+[hidden] { display:none !important; }
+#workspace-nav {display:flex; gap:8px; padding:10px 16px; border-bottom:1px solid var(--border); flex-wrap:wrap; align-items:center;}
+#workspace-nav button,.product-card button,#panel-search button,dialog button {background:var(--bg-surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:7px 12px;cursor:pointer;}
+#workspace-nav button.active {color:var(--accent);border-color:var(--accent);}
+#product-notice {font-size:12px;color:var(--text-dim);overflow-wrap:anywhere;}
+#workspace-panel {flex:1;overflow:auto;padding:20px;}
+#panel-search {display:flex;gap:8px;flex-wrap:wrap;}
+#panel-query {flex:1;min-width:160px;}
+#panel-hint {color:var(--text-dim);margin:12px 0;}
+.product-card {border:1px solid var(--border);border-radius:10px;padding:16px;margin:12px 0;background:var(--bg-surface);overflow-wrap:anywhere;}
+.product-card p {white-space:pre-wrap;color:var(--text-dim);margin:10px 0;}
+.product-card button {margin:4px 8px 0 0;}
+.product-card pre {white-space:pre-wrap;max-height:360px;overflow:auto;margin-top:12px;}
+dialog {margin:auto;background:var(--bg-surface);color:var(--text);border:1px solid var(--border);border-radius:12px;width:min(640px,95vw);padding:24px;}
+dialog::backdrop {background:#0009;}
+dialog label {display:block;margin:14px 0;}
+dialog textarea {display:block;width:100%;resize:vertical;}
+dialog input,dialog select,dialog textarea,#panel-query {padding:9px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:5px;font:inherit;}
 </style>
 </head>
 <body>
@@ -201,6 +220,25 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
       <span id="token-info"></span>
     </div>
   </div>
+  <nav id="workspace-nav" aria-label="工作区">
+    <button data-view="chat" class="active">对话</button><button data-view="history">历史</button>
+    <button data-view="runs">任务中心</button><button data-view="memories">记忆</button>
+    <button id="backup-db">备份数据</button><span id="product-notice" role="status"></span>
+  </nav>
+  <section id="workspace-panel" hidden>
+    <form id="panel-search"><input id="panel-query" aria-label="搜索关键词" placeholder="搜索历史对话或记忆"><button>搜索 / 刷新</button><button type="button" id="new-memory" hidden>添加记忆</button></form>
+    <p id="panel-hint"></p><div id="panel-items"></div>
+  </section>
+  <dialog id="memory-editor">
+    <form id="memory-form"><h2>编辑记忆</h2>
+      <label>范围 <select id="memory-scope"><option value="project">当前项目</option><option value="user">所有项目</option></select></label>
+      <label>名称 <input id="memory-name" required pattern="[a-z0-9]+(-[a-z0-9]+)*" maxlength="100" placeholder="例如 preferred-language"></label>
+      <label>内容 <textarea id="memory-body" rows="10" required maxlength="100000"></textarea></label>
+      <p>保存后会用于后续对话。名称使用小写英文、数字和短横线。</p>
+      <button type="submit">保存记忆</button><button type="button" id="memory-close">取消</button>
+    </form>
+  </dialog>
+
   <div id="messages"></div>
   <div id="input-area" style="position:relative;">
     <div id="slash-menu"></div>
@@ -238,9 +276,31 @@ if (typeof marked !== 'undefined') {
 
 function renderMarkdown(text) {
   if (typeof marked !== 'undefined') {
-    try { return marked.parse(text); } catch(e) {}
+    try { return sanitizeMarkdown(marked.parse(text)); } catch(e) {}
   }
   return escapeHtml(text);
+}
+
+function sanitizeMarkdown(html) {
+  const documentNode = new DOMParser().parseFromString(html,'text/html');
+  const allowed = new Set(['P','BR','STRONG','EM','DEL','CODE','PRE','BLOCKQUOTE','UL','OL','LI','H1','H2','H3','H4','H5','H6','HR','TABLE','THEAD','TBODY','TR','TH','TD','A']);
+  function clean(node) {
+    if (node.nodeType === 3) return document.createTextNode(node.textContent);
+    const fragment = document.createDocumentFragment();
+    if (node.nodeType !== 1 || ['SCRIPT','STYLE','IFRAME','OBJECT','EMBED','SVG','MATH'].includes(node.tagName)) return fragment;
+    const output = allowed.has(node.tagName) ? document.createElement(node.tagName.toLowerCase()) : fragment;
+    if (node.tagName === 'A') {
+      try {
+        const url = new URL(node.getAttribute('href') || '',location.href);
+        if (['http:','https:','mailto:'].includes(url.protocol)) { output.href=url.href; output.rel='noopener noreferrer'; }
+      } catch(error) {}
+    }
+    for (const child of node.childNodes) output.appendChild(clean(child));
+    return output;
+  }
+  const result = document.createElement('div');
+  for (const node of documentNode.body.childNodes) result.appendChild(clean(node));
+  return result.innerHTML;
 }
 
 function escapeHtml(s) {
@@ -266,6 +326,8 @@ function connect() {
   ws.onclose = () => {
     connStatus.innerHTML = '<span class="dot disconnected"></span>Reconnecting...';
     if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+    pendingProduct.forEach(request => { clearTimeout(request.timer); request.reject(new Error('连接已断开，请重试')); });
+    pendingProduct.clear();
     setTimeout(connect, 3000);
   };
 
@@ -279,6 +341,8 @@ function connect() {
 
 function handleMessage(msg) {
   switch (msg.type) {
+    case 'product_result': productReply(msg.data); break;
+
     case 'connected':
       if (!connectedOnce) {
         addSystem('Session: ' + msg.data.session + ' | CWD: ' + msg.data.cwd);
@@ -798,6 +862,90 @@ sendBtn.addEventListener('click', sendMessage);
 // 启动
 connect();
 inputEl.focus();
+// Product requests are unicast and correlated; they never enter model context.
+const pendingProduct = new Map();
+let productSequence = 0;
+let productView = 'chat';
+let creatingMemory = false;
+function productRequest(action, fields = {}) {
+  return new Promise((resolve, reject) => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) { reject(new Error('连接尚未就绪')); return; }
+    const request_id = String(++productSequence);
+    const timer = setTimeout(() => { pendingProduct.delete(request_id); reject(new Error('操作超时，请重试')); }, 15000);
+    pendingProduct.set(request_id, { resolve, reject, timer });
+    ws.send(JSON.stringify({type:'product_request',data:{action,request_id,...fields}}));
+  });
+}
+function productReply(data) {
+  const request = pendingProduct.get(data.request_id);
+  if (!request) return;
+  clearTimeout(request.timer); pendingProduct.delete(data.request_id);
+  if (data.ok) request.resolve(data.result); else request.reject(new Error(data.error));
+}
+function notice(text) { document.getElementById('product-notice').textContent = text; }
+function cardButton(card, title, action) {
+  const button = document.createElement('button'); button.type = 'button'; button.textContent = title;
+  button.onclick = async () => { button.disabled = true; try { await action(); } catch(error) { notice(error.message); } finally { button.disabled = false; } };
+  card.appendChild(button);
+}
+function showProductView(view) {
+  productView = view;
+  document.getElementById('workspace-panel').hidden = view === 'chat';
+  messagesEl.hidden = view !== 'chat'; document.getElementById('input-area').hidden = view !== 'chat';
+  document.querySelectorAll('[data-view]').forEach(button => button.classList.toggle('active',button.dataset.view === view));
+  document.getElementById('new-memory').hidden = view !== 'memories';
+  document.getElementById('panel-query').disabled = view === 'runs';
+  document.getElementById('panel-hint').textContent = view === 'runs' ? '任务和工具步骤会保留。恢复会话后，请明确下一步，工具不会自动重放。' : view === 'memories' ? '自动记忆以 Markdown 为准；此处支持搜索、编辑和删除。用户级记忆适用于所有项目。' : '只搜索当前项目的会话。恢复、重命名或导出历史对话。';
+  if (view !== 'chat') refreshProduct().catch(error => notice(error.message));
+}
+async function refreshProduct() {
+  const view = productView;
+  if (view === 'chat') return;
+  const query = document.getElementById('panel-query').value;
+  const items = await productRequest(view,{query});
+  if (productView !== view) return;
+  const list = document.getElementById('panel-items'); list.replaceChildren();
+  if (!items.length) { const p = document.createElement('p'); p.textContent = '暂无记录'; list.appendChild(p); return; }
+  for (const item of items) {
+    const card = document.createElement('article'); card.className = 'product-card';
+    const title = document.createElement('h3'); const detail = document.createElement('p');
+    card.append(title,detail);
+    if (view === 'history') {
+      title.textContent = item.title || '未命名会话'; detail.textContent = item.snippet;
+      cardButton(card,'恢复会话',async () => { await productRequest('session_resume',{id:item.session_id}); showProductView('chat'); notice('会话已恢复'); });
+      cardButton(card,'重命名',async () => { const title = prompt('会话名称',item.title); if (title !== null) { await productRequest('session_rename',{id:item.session_id,title}); await refreshProduct(); } });
+      cardButton(card,'导出',async () => { const result = await productRequest('session_export',{id:item.session_id}); const url = URL.createObjectURL(new Blob([result.text],{type:'application/x-ndjson;charset=utf-8'})); const a = document.createElement('a'); a.href = url; a.download = result.id+'.jsonl'; a.click(); setTimeout(() => URL.revokeObjectURL(url),1000); });
+    } else if (view === 'runs') {
+      title.textContent = item.prompt || '后台继续执行'; detail.textContent = item.status+' · '+item.source+' · '+item.started_at;
+      cardButton(card,'查看步骤',async () => { const result = await productRequest('run',{id:item.id}); let pre = card.querySelector('pre'); if (!pre) { pre=document.createElement('pre'); card.appendChild(pre); } pre.textContent = (result.error ? result.error+'\n' : '') + 'Tokens: '+result.input_tokens+' / '+result.output_tokens+'\n'+result.steps.map(step => step.tool_name+' · '+step.status+'\n'+step.output).join('\n\n'); });
+      if (['running','waiting_permission'].includes(item.status)) cardButton(card,'取消',async () => { await productRequest('run_cancel',{id:item.id}); await refreshProduct(); });
+      cardButton(card,'恢复会话',async () => { await productRequest('session_resume',{id:item.session_id}); showProductView('chat'); notice('已恢复会话，请说明下一步'); });
+    } else {
+      title.textContent = item.scope+'/'+item.name; detail.textContent = item.description+'\n'+item.body.slice(0,400);
+      cardButton(card,'编辑',async () => openMemoryEditor(item));
+      cardButton(card,'删除',async () => { if (confirm('删除记忆 '+item.scope+'/'+item.name+'？')) { await productRequest('memory_forget',{scope:item.scope,name:item.name}); await refreshProduct(); } });
+    }
+    list.appendChild(card);
+  }
+}
+function openMemoryEditor(item = null) {
+  creatingMemory = !item;
+  const scope=document.getElementById('memory-scope'), name=document.getElementById('memory-name');
+  scope.value=item ? item.scope : 'project'; name.value=item ? item.name : '';
+  scope.disabled=!!item; name.disabled=!!item;
+  document.getElementById('memory-body').value=item ? item.body : '';
+  document.getElementById('memory-editor').showModal();
+}
+document.querySelectorAll('[data-view]').forEach(button => { button.onclick=() => showProductView(button.dataset.view); });
+document.getElementById('panel-search').onsubmit=event => { event.preventDefault(); refreshProduct().catch(error => notice(error.message)); };
+document.getElementById('new-memory').onclick=() => openMemoryEditor();
+document.getElementById('memory-close').onclick=() => document.getElementById('memory-editor').close();
+document.getElementById('memory-form').onsubmit=async event => {
+  event.preventDefault();
+  const fields={scope:document.getElementById('memory-scope').value,name:document.getElementById('memory-name').value,body:document.getElementById('memory-body').value,create:creatingMemory};
+  try { await productRequest('memory_save',fields); document.getElementById('memory-editor').close(); notice('记忆已保存'); await refreshProduct(); } catch(error) { notice(error.message); }
+};
+document.getElementById('backup-db').onclick=async () => { try { const result=await productRequest('backup'); notice('备份已保存：'+result.path); } catch(error) { notice(error.message); } };
 </script>
 </body>
 </html>"""

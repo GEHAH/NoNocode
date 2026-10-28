@@ -67,6 +67,18 @@ flowchart LR
 
 试跑在独立临时目录里交替执行当前规则与候选规则，期望答案不提供给试跑助手，由固定 Python 检查器核对产物（`file_exists`、`text_contains`、`json_equals`、`csv_rows`）。只有 `passed` 才能采纳；之后随时可以 `/evolve revoke`。
 
+## 0.3.0 新增
+
+SQLite 会话和任务存储、历史搜索、可编辑的记忆管理，以及网页“历史 / 任务中心 / 记忆”面板。数据库默认位于本机 `~/.local/share/nonocode/nonocode.db`，旧会话首次启动自动导入。升级前请先结束旧实例并退出。
+
+```bash
+nonocode --history "关键词"  # 离线搜索
+nonocode --runs             # 持久化任务记录
+nonocode --doctor           # 本机诊断，不显示密钥
+```
+
+终端可用 `/history`、`/runs`、`/storage`；网页可恢复和导出会话、查看工具步骤、编辑记忆。详见 [0.3.0 升级与数据说明](RELEASE_NOTES_0.3.md)。
+
 ## 开始使用
 
 需要 Python 3.11 或更新版本。
@@ -118,7 +130,8 @@ nonocode --remote
 | `/help`、`/status` | 查看命令说明、当前模型与上下文状态 |
 | `/plan`、`/permission`、`/sandbox` | 切换规划模式、权限策略与操作系统沙箱 |
 | `/session`、`/compact`、`/clear`、`/rewind` | 管理会话、压缩上下文、清空对话或回退文件检查点 |
-| `/memory list\|edit\|clear` | 查看、定位或清空自动记忆 |
+| `/memory list\|search\|show\|add\|update\|forget` | 搜索、查看、编辑和删除自动记忆 |
+| `/history`、`/runs`、`/storage` | 历史搜索、任务中心与数据库备份 |
 | `/evolve feedback\|capability\|verify\|apply\|revoke` | 记录候选、跑对照验证、采纳或撤回规则 |
 | `/skill`、`/mcp`、`/worktree`、`/tasks`、`/trace` | 管理技能、MCP 服务、Git worktree、后台任务与子代理调用树 |
 
@@ -131,6 +144,7 @@ nonocode/
 ├── tools/                          # 文件、Bash、搜索、子代理、团队、任务、Skill 工具
 ├── agents/ & teams/                # 子代理定义、后台任务、队友通信与多后端启动
 ├── memory/                         # 指令加载、自动记忆、相关召回、会话与整理
+├── storage/                        # SQLite 会话、主执行记录、全文搜索与备份
 ├── evolution/                      # 候选账本、双臂对照验证与无模型演示
 ├── permissions/ & sandbox/         # 权限模式、危险命令检测、bubblewrap / Seatbelt
 ├── skills/ & mcp/ & hooks/         # 技能加载、MCP 客户端、生命周期 Hook

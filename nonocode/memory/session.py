@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 import random
 import string
 from dataclasses import dataclass, field
@@ -8,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import IO, Any
 
+from nonocode.storage import Database
 from nonocode.conversation import ConversationManager, Message, ToolResultBlock, ToolUseBlock
 
 SESSIONS_DIR = ".nonocode/sessions"
@@ -251,34 +254,36 @@ class SessionMeta:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_active: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
+    _save_callback: Any = field(default=None, repr=False, compare=False)
+
+    def to_dict(self) -> dict:
+        return {"id": self.id, "title": self.title, "summary": self.summary,
+                "message_count": self.message_count, "total_tokens": self.total_tokens,
+                "created_at": self.created_at.isoformat(), "last_active": self.last_active.isoformat()}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> SessionMeta:
+        return cls(id=data["id"], title=data.get("title", ""), summary=data.get("summary", ""),
+                   message_count=data.get("message_count", 0), total_tokens=data.get("total_tokens", 0),
+                   created_at=datetime.fromisoformat(data["created_at"]),
+                   last_active=datetime.fromisoformat(data["last_active"]))
+
     def save(self, path: Path) -> None:
-        data = {
-            "id": self.id,
-            "title": self.title,
-            "summary": self.summary,
-            "message_count": self.message_count,
-            "total_tokens": self.total_tokens,
-            "created_at": self.created_at.isoformat(),
-            "last_active": self.last_active.isoformat(),
-        }
-        path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        data = self.to_dict()
+        if self._save_callback is not None:
+            self._save_callback(data)
+        try:
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            if self._save_callback is None:
+                raise
+            logging.getLogger(__name__).warning("Session metadata export unavailable: %s", path)
 
     @classmethod
     def load(cls, path: Path) -> SessionMeta | None:
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return cls(
-                id=data["id"],
-                title=data.get("title", ""),
-                summary=data.get("summary", ""),
-                message_count=data.get("message_count", 0),
-                total_tokens=data.get("total_tokens", 0),
-                created_at=datetime.fromisoformat(data["created_at"]),
-                last_active=datetime.fromisoformat(data["last_active"]),
-            )
-        except (json.JSONDecodeError, KeyError, ValueError):
+            return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError, KeyError, ValueError, TypeError):
             return None
 
 
@@ -294,24 +299,34 @@ class Session:
         file: IO[str],
         meta: SessionMeta,
         sessions_dir: Path,
+        database: Database | None = None,
     ) -> None:
         self.session_id = session_id
         self._file = file
         self.meta = meta
         self._sessions_dir = sessions_dir
+        self._database = database
 
     def append(self, message: Message) -> None:
         records = SessionRecord.from_message(message)
-        for record in records:
-            self._file.write(record.to_jsonl() + "\n")
-        self._file.flush()
-
         self.meta.message_count += 1
         self.meta.last_active = datetime.now(timezone.utc)
-
         if not self.meta.title and message.role == "user" and message.content:
             self.meta.title = message.content[:TITLE_MAX_LENGTH]
+        self._append_records(records)
 
+    def _append_records(self, records: list[SessionRecord]) -> None:
+        if self._database is not None:
+            self._database.append_records(self.meta.to_dict(), [json.loads(record.to_jsonl()) for record in records])
+        if self._file is not None and not self._file.closed:
+            try:
+                for record in records:
+                    self._file.write(record.to_jsonl() + "\n")
+                self._file.flush()
+            except OSError:
+                if self._database is None:
+                    raise
+                logging.getLogger(__name__).warning("Transcript export unavailable for %s", self.session_id)
         self.meta.save(self._sessions_dir / f"{self.session_id}.meta")
 
     def append_new_messages(self, history: list[Message], after: Message | None) -> Message | None:
@@ -330,13 +345,12 @@ class Session:
         结构性标记而非对话轮次。last_active 仍会更新，以保证 session 按最近
         使用排序。
         """
-        self._file.write(record.to_jsonl() + "\n")
-        self._file.flush()
         self.meta.last_active = datetime.now(timezone.utc)
-        self.meta.save(self._sessions_dir / f"{self.session_id}.meta")
-
+        self._append_records([record])
 
     def close(self) -> None:
+        if self._database is not None:
+            self.meta.save(self._sessions_dir / f"{self.session_id}.meta")
         if self._file and not self._file.closed:
             self._file.flush()
             self._file.close()
@@ -403,104 +417,112 @@ def _generate_session_id() -> str:
 
 
 class SessionManager:
-    def __init__(self, work_dir: str) -> None:
-        self._sessions_dir = Path(work_dir) / SESSIONS_DIR
-        self._sessions_dir.mkdir(parents=True, exist_ok=True)
+    """SQLite is authoritative; old transcripts are imported once and kept as exports."""
 
+    def __init__(self, work_dir: str, database: Database | None = None) -> None:
+        self._sessions_dir = Path(work_dir) / SESSIONS_DIR
+        self.database = database or Database(work_dir)
+        try:
+            self._sessions_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            logging.getLogger(__name__).warning("Transcript export directory unavailable")
+        self._import_legacy()
+
+    @staticmethod
+    def _valid_id(session_id: str) -> bool:
+        return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", session_id))
+
+    def _import_legacy(self) -> int:
+        known = self.database.known_sessions()
+        count = 0
+        for path in self._sessions_dir.glob("*.meta"):
+            if path.stem in known or not self._valid_id(path.stem) or path.is_symlink():
+                continue
+            meta = SessionMeta.load(path)
+            transcript = path.with_suffix(".jsonl")
+            if meta is None or meta.id != path.stem or not transcript.is_file() or transcript.is_symlink():
+                continue
+            try:
+                records = []
+                for line in transcript.read_text(encoding="utf-8").splitlines():
+                    record = SessionRecord.from_jsonl(line)
+                    if record is not None:
+                        records.append(json.loads(record.to_jsonl()))
+                count += self.database.import_session(meta.to_dict(), records)
+            except (OSError, UnicodeError):
+                logging.getLogger(__name__).warning("Cannot import legacy session: %s", path.name)
+        return count
+
+    def _open(self, meta: SessionMeta) -> Session:
+        meta._save_callback = self.database.save_session
+        try:
+            file = open(self._sessions_dir / f"{meta.id}.jsonl", "a", encoding="utf-8")
+        except OSError:
+            file = None
+        return Session(meta.id, file, meta, self._sessions_dir, database=self.database)
 
     def create(self) -> Session:
-        session_id = _generate_session_id()
-        jsonl_path = self._sessions_dir / f"{session_id}.jsonl"
-        meta = SessionMeta(id=session_id)
-        meta.save(self._sessions_dir / f"{session_id}.meta")
-
-        file = open(jsonl_path, "a", encoding="utf-8")  # noqa: SIM115
-        return Session(
-            session_id=session_id,
-            file=file,
-            meta=meta,
-            sessions_dir=self._sessions_dir,
-        )
-
+        meta = SessionMeta(id=_generate_session_id())
+        self.database.save_session(meta.to_dict())
+        session = self._open(meta)
+        meta.save(self._sessions_dir / f"{meta.id}.meta")
+        return session
 
     def list(self) -> list[SessionMeta]:
-        metas: list[SessionMeta] = []
-        for meta_path in self._sessions_dir.glob("*.meta"):
-            meta = SessionMeta.load(meta_path)
-            if meta is not None:
-                metas.append(meta)
-        metas.sort(key=lambda m: m.last_active, reverse=True)
-        return metas
+        self._import_legacy()
+        return [SessionMeta.from_dict(meta) for meta in self.database.list_sessions()]
 
     def resume(self, session_id: str) -> ResumeResult | None:
-        jsonl_path = self._sessions_dir / f"{session_id}.jsonl"
-        meta_path = self._sessions_dir / f"{session_id}.meta"
-
-        if not jsonl_path.exists():
+        if not self._valid_id(session_id):
             return None
-
-        meta = SessionMeta.load(meta_path)
-        if meta is None:
+        self._import_legacy()
+        data = self.database.session_metadata(session_id)
+        if data is None:
             return None
-
-        records: list[SessionRecord] = []
-        with open(jsonl_path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                record = SessionRecord.from_jsonl(line)
-                if record is not None:
-                    records.append(record)
-
-        # 重建压缩后的状态：仅从最后一个 compact_boundary 开始重放。
-        # 该标记之前的 record 是已被摘要过的原始前缀——保留在磁盘上供审计，
-        # 但不再重放。标记本身内联了摘要 + 原样 keep 尾部，标记之后追加的
-        # 普通消息（续写）照常重放。没有 boundary 则全量重放（兼容旧 session）。
+        meta = SessionMeta.from_dict(data)
+        records = [record for raw in self.database.records(session_id)
+                   if (record := SessionRecord.from_jsonl(json.dumps(raw))) is not None]
         last_boundary = -1
-        for i, rec in enumerate(records):
-            if rec.is_compact_boundary():
-                last_boundary = i
+        for index, record in enumerate(records):
+            if record.is_compact_boundary():
+                last_boundary = index
         if last_boundary >= 0:
             records = records[last_boundary:]
-
-        messages = records_to_messages(records)
-
-        file = open(jsonl_path, "a", encoding="utf-8")  # noqa: SIM115
-        session = Session(
-            session_id=session_id,
-            file=file,
-            meta=meta,
-            sessions_dir=self._sessions_dir,
-        )
-
-        return ResumeResult(
-            session=session,
-            messages=messages,
-            last_active=meta.last_active,
-        )
+        return ResumeResult(self._open(meta), records_to_messages(records), meta.last_active)
 
     def delete(self, session_id: str) -> bool:
-        jsonl_path = self._sessions_dir / f"{session_id}.jsonl"
-        meta_path = self._sessions_dir / f"{session_id}.meta"
-
-        deleted = False
-        if jsonl_path.exists():
-            jsonl_path.unlink()
-            deleted = True
-        if meta_path.exists():
-            meta_path.unlink()
-            deleted = True
+        if not self._valid_id(session_id):
+            return False
+        self._import_legacy()
+        deleted = self.database.delete_session(session_id)
+        for suffix in (".jsonl", ".meta"):
+            try:
+                (self._sessions_dir / f"{session_id}{suffix}").unlink(missing_ok=True)
+            except OSError:
+                logging.getLogger(__name__).warning("Cannot remove transcript export for %s", session_id)
         return deleted
 
     def cleanup(self, max_age_days: int = DEFAULT_MAX_AGE_DAYS) -> int:
         cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
-        removed = 0
+        return sum(self.delete(meta.id) for meta in self.list() if meta.last_active < cutoff)
 
-        for meta_path in list(self._sessions_dir.glob("*.meta")):
-            meta = SessionMeta.load(meta_path)
-            if meta is not None and meta.last_active < cutoff:
-                self.delete(meta.id)
-                removed += 1
+    def search(self, query: str, limit: int = 20) -> list[dict]:
+        self._import_legacy()
+        return self.database.search(query, limit)
 
-        return removed
+    def rename(self, session_id: str, title: str) -> None:
+        title = title.strip()
+        if not title or len(title) > 200:
+            raise ValueError("会话标题须为 1–200 个字符")
+        data = self.database.session_metadata(session_id)
+        if data is None:
+            raise ValueError("会话不存在")
+        data['title'] = title
+        self.database.save_session(data)
+
+    def export(self, session_id: str) -> str:
+        data = self.database.session_metadata(session_id)
+        if data is None:
+            raise ValueError("会话不存在")
+        return "".join(json.dumps(record, ensure_ascii=False) + "\n"
+                       for record in self.database.records(session_id))

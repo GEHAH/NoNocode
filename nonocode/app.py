@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import random
+import sqlite3
 import time as _time
 from pathlib import Path
 from typing import Any
@@ -11,10 +13,12 @@ from rich.markup import escape
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.message import Message as TMessage
 from textual.widgets import Markdown, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
+from nonocode.storage.runs import TrackedRun
 from nonocode.agent import (
     Agent,
     CompactNotification,
@@ -620,6 +624,8 @@ class NoNocodeApp(App):
         self._mcp_init_task: asyncio.Task[None] | None = None
         self._selected_provider: ProviderConfig | None = None
         self._streaming = False
+        self._current_run_id: str | None = None
+        self._session_token_offset = 0
         self._thinking_start: float = 0.0
         self._thinking_verb: str = ""
         self._spinner_idx: int = 0
@@ -627,6 +633,8 @@ class NoNocodeApp(App):
         self._spinner_label: Static | None = None
         self._mcp_server_info: str = ""
         self._agent_task: asyncio.Task[None] | None = None
+        self._pending_perm_request: PermissionRequest | None = None
+        self._pending_perm_widget = None
         self._subagent_task: asyncio.Task[None] | None = None
         self._subagent_start_time: float | None = None
         self.session_manager: SessionManager | None = None
@@ -1066,6 +1074,7 @@ class NoNocodeApp(App):
         )
 
     def _set_session(self, session: Session) -> None:
+        self._session_token_offset = session.meta.total_tokens
         self.session = session
         if self.agent:
             self.agent.session_id = session.session_id
@@ -1122,6 +1131,10 @@ class NoNocodeApp(App):
             self._show_system_message(cmd.arg_prompt)
             return
 
+        from nonocode.commands.registry import requires_idle
+        if self._streaming and requires_idle(cmd,args):
+            self._show_system_message('请等待或取消当前任务后再执行此操作')
+            return
         ctx = self._build_command_context(args)
         try:
             await cmd.handler(ctx)
@@ -1226,6 +1239,12 @@ class NoNocodeApp(App):
                 block._collapsed = not block._collapsed
                 block._render_done()
 
+    def cancel_run(self, run_id: str) -> bool:
+        if run_id != self._current_run_id or self._agent_task is None or self._agent_task.done():
+            return False
+        self._agent_task.cancel()
+        return True
+
     def action_cancel(self) -> None:
         popup = self.query_one(CompletionPopup)
         if popup.is_visible:
@@ -1314,6 +1333,19 @@ class NoNocodeApp(App):
             self.agent.set_skill_catalog("")
 
     async def _send_message(self, text: str, is_notification: bool = False) -> None:
+        try:
+            await self._send_message_impl(text,is_notification)
+        except (sqlite3.Error,OSError) as exc:
+            logging.getLogger(__name__).exception('Local persistence failed')
+            self._current_run_id = None
+            await self._clear_permission_prompt()
+            for block in self.query(ToolCallBlock):
+                if block._loading:
+                    block.set_result('本地记录保存失败，执行已结束。',True,0.0)
+            self._finish_streaming()
+            self._show_error(f'本地记录保存失败: {exc}')
+
+    async def _send_message_impl(self, text: str, is_notification: bool = False) -> None:
         assert self.agent is not None
         self._refresh_skills_if_needed()
 
@@ -1389,14 +1421,19 @@ class NoNocodeApp(App):
 
         await asyncio.sleep(0)
 
+        run = TrackedRun(self.session_manager.database, self.session.session_id, text, 'tui',
+                         input_offset=self.agent.total_input_tokens, output_offset=self.agent.total_output_tokens)
+        self._current_run_id = run.id
+        tracked_events = run.events(self.agent.run(self.conversation))
         try:
-            async for event in self.agent.run(self.conversation):
+            async for event in tracked_events:
                 if isinstance(event, ThinkingText):
                     self.call_after_refresh(chat.scroll_end, animate=False)
 
                 elif isinstance(event, StreamText):
-                    if streaming_label is not None and not accumulated_text:
-                        await streaming_label.remove()
+                    if not accumulated_text:
+                        if streaming_label is not None:
+                            await streaming_label.remove()
                         streaming_label = Static("", classes="message ai-message")
                         await ai_row.mount(streaming_label)
                     accumulated_text += event.text
@@ -1521,7 +1558,7 @@ class NoNocodeApp(App):
                     if self.session:
                         history_cursor = self.session.append_new_messages(self.conversation.history, history_cursor)
                         self.session.meta.total_tokens = (
-                            self.agent.total_input_tokens
+                            self._session_token_offset + self.agent.total_input_tokens
                             + self.agent.total_output_tokens
                         )
                         asyncio.ensure_future(
@@ -1543,6 +1580,7 @@ class NoNocodeApp(App):
             self.call_after_refresh(chat.scroll_end, animate=False)
 
         except asyncio.CancelledError:
+            run.finish('cancelled','用户取消了本次执行')
             if accumulated_text:
                 if streaming_label is not None:
                     await streaming_label.remove()
@@ -1553,8 +1591,23 @@ class NoNocodeApp(App):
                 await ai_row.mount(md)
             self._show_system_message("Operation cancelled")
         except LLMError as e:
+            run.finish('failed',str(e))
             self._show_error(str(e))
+        except Exception as e:
+            run.finish('failed',str(e))
+            logging.getLogger(__name__).exception("Agent interaction failed")
+            self._show_error(f"执行失败: {e}")
         finally:
+            await tracked_events.aclose()
+            if self.session:
+                self.session.append_new_messages(self.conversation.history, history_cursor)
+                self.session.meta.total_tokens = self._session_token_offset + self.agent.total_input_tokens + self.agent.total_output_tokens
+                self.session.meta.save(self.session._sessions_dir / f"{self.session.session_id}.meta")
+            self._current_run_id = None
+            await self._clear_permission_prompt()
+            for block in tool_blocks.values():
+                if isinstance(block, ToolCallBlock) and block._loading:
+                    block.set_result("未收到工具执行结果：本轮执行已中断。", True, 0.0)
             self._finish_streaming()
             input_widget.focus()
 
@@ -1795,9 +1848,11 @@ class NoNocodeApp(App):
     async def _handle_permission_request(self, request: PermissionRequest) -> None:
         from nonocode.permission_dialog import InlinePermissionWidget
 
+        await self._clear_permission_prompt()
         chat = self.query_one("#chat-area", VerticalScroll)
         widget = InlinePermissionWidget(request.tool_name, request.description)
         self._pending_perm_request = request
+        self._pending_perm_widget = widget
         await chat.mount(widget)
         self.call_after_refresh(chat.scroll_end, animate=False)
         # 权限提示弹窗期间禁用输入框
@@ -1806,27 +1861,33 @@ class NoNocodeApp(App):
         except Exception:
             pass
 
-    def on_inline_permission_widget_responded(
+    async def on_inline_permission_widget_responded(
         self, event: "InlinePermissionWidget.Responded"
     ) -> None:
-        from nonocode.permission_dialog import InlinePermissionWidget
+        if event.widget is not self._pending_perm_widget:
+            return
+        await self._clear_permission_prompt(event.response)
 
-        req = getattr(self, "_pending_perm_request", None)
-        if req is not None:
-            req.future.set_result(event.response)
-            self._pending_perm_request = None
-        # 从聊天区移除权限弹窗组件
+    async def _clear_permission_prompt(self, response: PermissionResponse | None = None) -> None:
+        request, widget = self._pending_perm_request, self._pending_perm_widget
+        self._pending_perm_request = None
+        self._pending_perm_widget = None
         try:
-            widget = self.query_one("#perm-inline", InlinePermissionWidget)
-            widget.remove()
-        except Exception:
-            pass
-        # 重新启用输入框
-        try:
-            self.query_one("#chat-input").disabled = False
-            self.query_one("#chat-input").focus()
-        except Exception:
-            pass
+            if widget is not None and widget.parent is not None:
+                # Do not resume the agent until Textual has removed the old ID.
+                await widget.remove()
+            try:
+                input_widget = self.query_one("#chat-input", ChatInput)
+                input_widget.disabled = False
+                input_widget.focus()
+            except NoMatches:
+                pass
+        finally:
+            if request is not None and not request.future.done():
+                if response is None:
+                    request.future.cancel()
+                else:
+                    request.future.set_result(response)
 
     # -----------------------------------------------------------------
     # 恢复 session 的消息渲染
@@ -1862,15 +1923,13 @@ class NoNocodeApp(App):
     async def _update_session_summary(self) -> None:
         if not self.session or not self.client or not self.agent:
             return
+        session = self.session
+        conversation = ConversationManager(history=list(self.conversation.history))
         try:
-            summary = await generate_session_summary(
-                self.client, self.conversation, self.agent.protocol
-            )
+            summary = await generate_session_summary(self.client, conversation, self.agent.protocol)
             if summary:
-                self.session.meta.summary = summary
-                self.session.meta.save(
-                    self.session._sessions_dir / f"{self.session.session_id}.meta"
-                )
+                session.meta.summary = summary
+                session.meta.save(session._sessions_dir / f"{session.session_id}.meta")
         except Exception:
             pass
 

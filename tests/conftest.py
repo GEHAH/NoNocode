@@ -5,7 +5,7 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def isolate_teams_dir(tmp_path):
+def isolate_teams_dir(tmp_path, monkeypatch):
     """把团队根目录指到临时目录，让团队配置落在测试自己的沙箱里。
 
     团队目录是 <home>/.nonocode/teams，不重定向的话跑一次测试就会在真实主目录里
@@ -15,6 +15,7 @@ def isolate_teams_dir(tmp_path):
     解析路径，全局替换会连带改掉它们的行为。目录名避开 "home"，
     memory 的用例会在同一个 tmp_path 下自己建这个名字的目录。
     """
+    monkeypatch.setenv("NONOCODE_DATA_DIR", str(tmp_path / "database"))
     home = tmp_path / "teams-home"
     home.mkdir(parents=True, exist_ok=True)
     with patch("nonocode.teams.models.Path.home", return_value=home):
