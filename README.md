@@ -42,7 +42,7 @@ flowchart LR
 
 ### 执行任务
 
-- **文件与命令。** 内置 `ReadFile`、`WriteFile`、`EditFile`、`Glob`、`Grep`、`Bash`，多轮调用直到任务做完。上下文接近上限时自动摘要，并尽量保留最近读过的文件和正在使用的技能。
+- **文件与命令。** 内置 `ReadFile`、`WriteFile`、`EditFile`、`Glob`、`Grep`、`Bash`、`WebSearch`、`WebFetch`，多轮调用直到任务做完。上下文接近上限时自动摘要，并尽量保留最近读过的文件和正在使用的技能。
 - **子代理与团队。** 只读探索（`Explore`）、方案规划（`Plan`）和通用执行交给独立子代理。复杂任务可以建团队，用邮箱消息和共享任务板协作；队友可跑在当前进程、tmux 或 iTerm2 窗格里。
 - **扩展能力。** 按需加载 `.nonocode/skills/` 与 `~/.nonocode/skills/` 里的技能包；MCP 工具延迟检索，不在开局塞满上下文；会话、轮次、工具调用和文件变更都可挂 Hook。
 - **三种入口。** 终端交互界面、`nonocode -p` 单次执行（支持 `--output-format stream-json`），以及 `--remote` 浏览器界面。
@@ -65,7 +65,35 @@ flowchart LR
 /evolve apply <候选完整ID>
 ```
 
-试跑在独立临时目录里交替执行当前规则与候选规则，期望答案不提供给试跑助手，由固定 Python 检查器核对产物（`file_exists`、`text_contains`、`json_equals`、`csv_rows`）。只有 `passed` 才能采纳；之后随时可以 `/evolve revoke`。
+试跑在独立临时目录里交替执行当前规则与候选规则，期望答案不提供给试跑助手，由固定 Python 检查器核对产物（`file_exists`、`text_contains`、`json_equals`、`csv_rows`）。新候选须同时选择开发任务与保留任务，只有 `passed` 才能采纳；之后随时可以 `/evolve revoke`。
+
+## 0.6.0 新增（含 0.5 工作台）
+
+浏览器增加 **产物、来源、用量与执行树、配置、进化实验室**。产物可预览、比较和连同来源导出；配置可直接编辑并测试连接；模型用量覆盖子代理和后台记忆调用，并共享根任务预算。
+
+记忆增加原话依据、有效期、主题冲突和访问收据。新能力候选必须通过开发任务与保留任务的重复对照验证后才能采纳，支持逐次轨迹、产物、版本记录和撤回。SQLite 自动升级并保留历史，移动工作区继续关联原有数据。
+
+```bash
+nonocode --remote              # 打开浏览器工作台
+nonocode --artifacts           # 离线查看归档产物
+nonocode --sources             # 离线查看来源
+nonocode --usage               # 离线查看模型用量和执行树
+```
+
+配置步骤、预算边界、保留任务与迁移说明见 [0.6.0 使用和升级说明](RELEASE_NOTES_0.6.md)。
+
+## 0.4.0 新增
+
+执行取消会清理工具任务和同组子进程，失败退出码正确记录；增加执行时间、轮次、工具调用与 token 限额，以及网页断线恢复。`ReadFile`、`Glob`、`Grep` 使用可终止的读取进程。
+
+内置 `WebSearch` 和 `WebFetch`，默认可免额外搜索密钥联网，返回来源链接和抓取时间。直接提出“搜索官方文档并读取原文，附来源链接”即可使用；可配置 Brave API。
+
+```bash
+nonocode --backup /absolute/path/backup.zip
+nonocode --restore-backup /absolute/path/backup.zip --restore-to /absolute/path/new-restore
+```
+
+新增完整数据备份及校验恢复，配置中的密钥字段脱敏，恢复到新目录。默认限额、联网配置与覆盖范围见 [0.4.0 升级说明](RELEASE_NOTES_0.4.md)。
 
 ## 0.3.0 新增
 

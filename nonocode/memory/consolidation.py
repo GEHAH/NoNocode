@@ -106,6 +106,8 @@ class MemoryConsolidator:
             logger.debug("[consolidation] failed, rolling back lock")
             _rollback_lock(self._mem_dir, prior_mtime)
 
+    from nonocode.execution import usage_phase
+    @usage_phase("memory_consolidation")
     async def _do_consolidation(
         self,
         client: Any,

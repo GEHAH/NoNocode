@@ -343,6 +343,30 @@ function handleMessage(msg) {
   switch (msg.type) {
     case 'product_result': productReply(msg.data); break;
 
+    case 'state_sync': {
+      messagesEl.innerHTML = '';
+      currentAssistantEl = null;
+      currentStreamText = '';
+      currentThinkingEl = null;
+      currentThinkingText = '';
+      Object.keys(toolElements).forEach(key => delete toolElements[key]);
+      for (const event of (msg.data.history || [])) handleMessage(event);
+      for (const event of (msg.data.events || [])) handleMessage(event);
+      for (const permission of (msg.data.permissions || [])) addPermissionDialog(permission);
+      if (msg.data.truncated) addSystem('部分输出超过重连缓存上限；完整工具记录请查看任务详情。');
+      streaming = !!msg.data.streaming;
+      if (!streaming) finishPendingUI();
+      updateUI();
+      scrollToBottom();
+      break;
+    }
+
+    case 'run_state':
+      streaming = !!msg.data.streaming;
+      if (!streaming) finishPendingUI();
+      updateUI();
+      break;
+
     case 'connected':
       if (!connectedOnce) {
         addSystem('Session: ' + msg.data.session + ' | CWD: ' + msg.data.cwd);
@@ -359,7 +383,11 @@ function handleMessage(msg) {
       break;
 
     case 'clear':
+      finishPendingUI();
       messagesEl.innerHTML = '';
+      currentAssistantEl = null; currentStreamText = '';
+      currentThinkingEl = null; currentThinkingText = '';
+      Object.keys(toolElements).forEach(key => delete toolElements[key]);
       addSystem('Conversation cleared.');
       break;
 
@@ -467,6 +495,19 @@ function handleMessage(msg) {
     case 'retry':
       addSystem('↻ Retrying: ' + msg.data.reason);
       break;
+  }
+}
+
+function finishPendingUI() {
+  if (currentAssistantEl) updateAssistant(currentAssistantEl, currentStreamText, false);
+  currentAssistantEl = null; currentStreamText = '';
+  currentThinkingEl = null; currentThinkingText = '';
+  document.querySelectorAll('.perm-dialog .actions').forEach(el => el.remove());
+  for (const key of Object.keys(toolElements)) {
+    const block = toolElements[key];
+    const status = block.querySelector('.status');
+    if (status) { status.textContent = '已停止'; status.className = 'status err'; }
+    delete toolElements[key];
   }
 }
 
@@ -949,3 +990,12 @@ document.getElementById('backup-db').onclick=async () => { try { const result=aw
 </script>
 </body>
 </html>"""
+
+
+from nonocode.web_workbench import WORKBENCH_HTML, WORKBENCH_JS
+INDEX_HTML = INDEX_HTML.replace('<dialog id="memory-editor">', WORKBENCH_HTML + '<dialog id="memory-editor">')
+INDEX_HTML = INDEX_HTML.replace('<p>保存后会用于后续对话。', '<label>原话依据或编辑说明 <textarea id="memory-evidence" maxlength="2000"></textarea></label><label>适用主题 <input id="memory-topic" maxlength="100"></label><label>过期时间（ISO，留空长期有效）<input id="memory-expires"></label><label><input type="checkbox" id="memory-enabled" checked>参与后续检索</label><p>保存后会用于后续对话。')
+INDEX_HTML = INDEX_HTML.replace('</script>\n</body>', WORKBENCH_JS + '\n</script>\n</body>')
+INDEX_HTML = INDEX_HTML.replace('}, 15000);', "}, ['settings_test','settings_save','backup','artifact_download'].includes(action) ? 45000 : 15000);")
+INDEX_HTML = INDEX_HTML.replace('dialog input,dialog select,dialog textarea,#panel-query', 'dialog input,dialog select,dialog textarea,#panel-query,.product-card input,.product-card select')
+INDEX_HTML = INDEX_HTML.replace('</style>', 'dialog pre {white-space:pre-wrap;max-height:400px;overflow:auto;} .product-card label {display:block;margin:12px 0;} .product-card label input:not([type=checkbox]),.product-card label select {display:block;width:min(100%,560px);} #workspace-nav {flex-wrap:wrap;}\n</style>')

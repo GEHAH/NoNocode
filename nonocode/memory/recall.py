@@ -14,7 +14,7 @@ from typing import Awaitable, Callable
 # ---------------------------------------------------------------------------
 
 MAX_MEMORY_FILES = 200
-FRONTMATTER_MAX_LINES = 30
+FRONTMATTER_MAX_LINES = 200
 ENTRYPOINT_NAME = "MEMORY.md"
 VALID_TYPES = {"user", "feedback", "project", "reference"}
 
@@ -185,6 +185,8 @@ def _read_memory_header(
                     break
                 lines.append(line)
         content = "".join(lines)
+        from nonocode.memory.provenance import active
+        if not active(content): return None
     except OSError:
         return None
 

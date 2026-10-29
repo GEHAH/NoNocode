@@ -15,6 +15,7 @@ from nonocode.commands.handlers.rewind import REWIND_COMMAND
 from nonocode.commands.handlers.status import STATUS_COMMAND
 from nonocode.commands.registry import CommandRegistry
 from nonocode.commands.handlers.product import PRODUCT_COMMANDS
+from nonocode.commands.handlers.workbench import WORKBENCH_COMMANDS
 
 
 ALL_COMMANDS = [
@@ -32,6 +33,7 @@ ALL_COMMANDS = [
     STATUS_COMMAND,
     SKILL_COMMAND,
     *PRODUCT_COMMANDS,
+    *WORKBENCH_COMMANDS,
 ]
 
 

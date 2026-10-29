@@ -54,6 +54,17 @@ const tick=()=>new Promise(resolve=>setTimeout(resolve,20));
  assert(cleaned.includes('<strong>bold</strong>'));
  assert(cleaned.includes('https://example.com'));
  assert(requests.every(request=>request.request_id));
- console.log('PASS: history, task steps, memory editing/creation, request correlation, HTML sanitization');
+ window.handleMessage({type:'state_sync',data:{streaming:true,history:[{type:'replay_user',data:{content:'Reconnect question'}}],
+   events:[{type:'stream_text',data:{text:'Partial reply'}},{type:'tool_use',data:{toolId:'pending',toolName:'Bash',args:{command:'printf done'}}}],
+   permissions:[{id:'perm_123',toolName:'Bash',description:'Review'}]}});
+ assert.match(document.getElementById('messages').textContent,/Reconnect question/);
+ assert.match(document.getElementById('messages').textContent,/Partial reply/);
+ assert(document.getElementById('perm-perm_123'));
+ assert(document.getElementById('input').disabled);
+ window.handleMessage({type:'run_state',data:{streaming:false}});
+ assert.equal(document.getElementById('input').disabled,false);
+ assert.equal(document.querySelectorAll('.perm-dialog .actions').length,0);
+ assert.match(document.querySelector('.tool-block .status').textContent,/已停止/);
+ console.log('PASS: product panels, memory editing, request correlation, sanitization, reconnect and terminal cleanup');
  window.close();
 })().catch(error=>{console.error(error);window.close();process.exitCode=1;});

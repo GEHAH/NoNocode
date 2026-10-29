@@ -254,35 +254,37 @@ class _ToolExecResult:
     elapsed: float
 
 
+from nonocode.limits import RunLimits, RunLimitError, current_budget, bounded_events
+
+
 class StreamingExecutor:
     def __init__(self) -> None:
-        self._tasks: list[tuple[int, asyncio.Task[_ToolExecResult]]] = []
-        self._order = 0
+        self._tasks = []
 
-    def submit(
-        self,
-        coro: Any,
-    ) -> None:
-        task = asyncio.create_task(coro)
-        self._tasks.append((self._order, task))
-        self._order += 1
+    def submit(self, coro: Any, tool_id: str = "", tool_name: str = "") -> None:
+        self._tasks.append((tool_id, tool_name, asyncio.create_task(coro)))
+
+    async def cancel(self) -> None:
+        tasks = [task for _, _, task in self._tasks]
+        self._tasks.clear()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def collect_results(self) -> list[_ToolExecResult]:
-        if not self._tasks:
-            return []
-        tasks = [t for _, t in sorted(self._tasks, key=lambda x: x[0])]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        out: list[_ToolExecResult] = []
-        for r in results:
-            if isinstance(r, Exception):
-                out.append(_ToolExecResult(
-                    tool_id="",
-                    tool_name="",
-                    result=ToolResult(output=f"Tool execution error: {r}", is_error=True),
-                    elapsed=0.0,
-                ))
-            else:
-                out.append(r)
+        entries = list(self._tasks)
+        results = await asyncio.gather(*(task for _, _, task in entries), return_exceptions=True)
+        self._tasks.clear()
+        out = []
+        for (tool_id, tool_name, _), result in zip(entries, results):
+            if isinstance(result, RunLimitError):
+                raise result
+            if isinstance(result, BaseException):
+                result = _ToolExecResult(tool_id, tool_name, ToolResult(
+                    output=f"Tool execution error: {result}", is_error=True), 0.0)
+            out.append(result)
         return out
 
 
@@ -298,6 +300,7 @@ class Agent:
         protocol: str,
         work_dir: str = ".",
         max_iterations: int = 0,
+        run_limits: RunLimits | None = None,
         permission_checker: PermissionChecker | None = None,
         context_window: int = 200_000,
         instructions_content: str = "",
@@ -309,6 +312,7 @@ class Agent:
         self.protocol = protocol
         self.work_dir = work_dir
         self.max_iterations = max_iterations
+        self.run_limits = run_limits or RunLimits()
         self.permission_checker = permission_checker
         self.permission_mode: PermissionMode = (
             permission_checker.mode if permission_checker else PermissionMode.DEFAULT
@@ -461,6 +465,33 @@ class Agent:
             )
 
     async def run(self, conversation: ConversationManager) -> AsyncIterator[AgentEvent]:
+        from nonocode.execution import agent_scope
+        prompt = next((message.content for message in reversed(conversation.history) if message.role == 'user'), '')
+        try:
+            async with agent_scope(self, prompt) as outcome:
+                events = self._limited_run(conversation)
+                try:
+                    async for event in events:
+                        if isinstance(event,ErrorEvent):
+                            outcome["error"]=event.message
+                        yield event
+                finally:
+                    await events.aclose()
+
+        except RunLimitError as exc:
+            yield ErrorEvent(message=str(exc))
+
+    async def _limited_run(self, conversation: ConversationManager) -> AsyncIterator[AgentEvent]:
+        events = bounded_events(lambda: self._run(conversation), self.run_limits)
+        try:
+            async for event in events:
+                yield event
+        except RunLimitError as exc:
+            yield ErrorEvent(message=str(exc))
+        finally:
+            await events.aclose()
+
+    async def _run(self, conversation: ConversationManager) -> AsyncIterator[AgentEvent]:
         self._current_conversation = conversation
         env_context = build_environment_context(
             self.work_dir, self.active_skills, self._skill_catalog, self._agent_catalog
@@ -481,320 +512,350 @@ class Agent:
         max_tokens_escalated = False
         output_recoveries = 0
 
-        while True:
-            iteration += 1
+        executor = None
+        llm_stream = None
+        try:
+            while True:
+                iteration += 1
+                from nonocode.execution import iteration_started
+                iteration_started()
+                budget = current_budget.get()
+                if budget:
+                    budget.check(iteration)
+                if executor is not None:
+                    await executor.cancel()
+                close_stream = getattr(llm_stream, "aclose", None)
+                if close_stream:
+                    await close_stream()
 
-            if self.max_iterations > 0 and iteration > self.max_iterations:
-                yield ErrorEvent(
-                    message=f"Agent reached maximum iterations ({self.max_iterations})"
-                )
-                break
-
-            if self.hook_engine:
-                ctx = self._build_hook_context("turn_start")
-                await self.hook_engine.run_hooks("turn_start", ctx)
-                for he in self._drain_hook_events():
-                    yield he
-
-            self._consume_mailbox(conversation)
-            if self.notification_fn:
-                for note in self.notification_fn():
-                    conversation.add_system_reminder(note)
-
-            if self.hook_engine:
-                ctx = self._build_hook_context("pre_send")
-                await self.hook_engine.run_hooks("pre_send", ctx)
-                for he in self._drain_hook_events():
-                    yield he
-
-            hook_prompts = (
-                self.hook_engine.get_prompt_messages() if self.hook_engine else None
-            )
-            system = build_system_prompt(hook_prompts=hook_prompts)
-
-            if self.plan_mode:
-                plan_path = str(self._get_plan_path())
-                if self.permission_checker:
-                    self.permission_checker.plan_file_path = plan_path
-                plan_exists = self._get_plan_path().exists()
-                plan_reminder = build_plan_mode_reminder(
-                    plan_path, plan_exists, iteration
-                )
-                conversation.add_system_reminder(plan_reminder)
-
-            # Coordinator 模式：工具集被收窄的同时注入调度指引。
-            # 走 system-reminder 而不是替换系统提示词：长会话里开头那份约束会被淹没，
-            # 每轮追加一次才拉得回来，而且 Lead 仍然需要身份、环境、项目指令和记忆这些基础段落。
-            if self.coordinator_mode:
-                from nonocode.teams.coordinator import get_coordinator_reminder
-
-                conversation.add_system_reminder(
-                    get_coordinator_reminder(
-                        iteration,
-                        agent_catalog=self._agent_catalog_list or None,
+                if self.max_iterations > 0 and iteration > self.max_iterations:
+                    yield ErrorEvent(
+                        message=f"Agent reached maximum iterations ({self.max_iterations})"
                     )
-                )
+                    break
 
-            if self.hook_engine:
-                for note in self.hook_engine.drain_notifications():
+                if self.hook_engine:
+                    ctx = self._build_hook_context("turn_start")
+                    await self.hook_engine.run_hooks("turn_start", ctx)
+                    for he in self._drain_hook_events():
+                        yield he
+
+                self._consume_mailbox(conversation)
+                if self.notification_fn:
+                    for note in self.notification_fn():
+                        conversation.add_system_reminder(note)
+
+                if self.hook_engine:
+                    ctx = self._build_hook_context("pre_send")
+                    await self.hook_engine.run_hooks("pre_send", ctx)
+                    for he in self._drain_hook_events():
+                        yield he
+
+                hook_prompts = (
+                    self.hook_engine.get_prompt_messages() if self.hook_engine else None
+                )
+                system = build_system_prompt(hook_prompts=hook_prompts)
+
+                if self.plan_mode:
+                    plan_path = str(self._get_plan_path())
+                    if self.permission_checker:
+                        self.permission_checker.plan_file_path = plan_path
+                    plan_exists = self._get_plan_path().exists()
+                    plan_reminder = build_plan_mode_reminder(
+                        plan_path, plan_exists, iteration
+                    )
+                    conversation.add_system_reminder(plan_reminder)
+
+                # Coordinator 模式：工具集被收窄的同时注入调度指引。
+                # 走 system-reminder 而不是替换系统提示词：长会话里开头那份约束会被淹没，
+                # 每轮追加一次才拉得回来，而且 Lead 仍然需要身份、环境、项目指令和记忆这些基础段落。
+                if self.coordinator_mode:
+                    from nonocode.teams.coordinator import get_coordinator_reminder
+
                     conversation.add_system_reminder(
-                        f"Hook [{note.hook_id}] {note.event}: {note.output}"
+                        get_coordinator_reminder(
+                            iteration,
+                            agent_catalog=self._agent_catalog_list or None,
+                        )
                     )
 
-            deferred_names = self.registry.get_deferred_tool_names()
-            if deferred_names:
-                conversation.add_system_reminder(
-                    "The following deferred tools are available via ToolSearch. "
-                    "Their schemas are NOT loaded - use ToolSearch with "
-                    'query "select:<name>[,<name>...]" to load tool schemas before calling them:\n'
-                    + "\n".join(deferred_names)
+                if self.hook_engine:
+                    for note in self.hook_engine.drain_notifications():
+                        conversation.add_system_reminder(
+                            f"Hook [{note.hook_id}] {note.event}: {note.output}"
+                        )
+
+                deferred_names = self.registry.get_deferred_tool_names()
+                if deferred_names:
+                    conversation.add_system_reminder(
+                        "The following deferred tools are available via ToolSearch. "
+                        "Their schemas are NOT loaded - use ToolSearch with "
+                        'query "select:<name>[,<name>...]" to load tool schemas before calling them:\n'
+                        + "\n".join(deferred_names)
+                    )
+
+                tools = self.registry.get_all_schemas(self.protocol)
+
+                # Layer 2: 接近 context window 上限时自动 compact
+                # Layer 1（工具结果预算）在结果入历史时已处理完，历史里的内容
+                # 就是最终大小，直接用 conversation.history 估算
+                compact_result = await auto_compact(
+                    conversation,
+                    self.client,
+                    self.context_window,
+                    self.session_dir,
+                    protocol=self.protocol,
+                    breaker=self.compact_breaker,
+                    recovery=self.recovery_state,
+                    tool_schemas=self.registry.get_all_schemas(self.protocol),
+                    transcript_path=self._transcript_path,
                 )
+                if isinstance(compact_result, CompactEvent):
+                    yield CompactNotification(
+                        before_tokens=compact_result.before_tokens,
+                        message=f"上下文已压缩（压缩前 {compact_result.before_tokens:,} tokens）",
+                        boundary=compact_result.boundary,
+                    )
+                    conversation.inject_environment(env_context)
+                    mem = self.memory_manager.load() if self.memory_manager else ""
+                    conversation.inject_long_term_memory(
+                        self.instructions_content, mem
+                    )
+                    self._sync_evolution_guidance(conversation)
+                elif isinstance(compact_result, str):
+                    yield ErrorEvent(message=compact_result)
 
-            tools = self.registry.get_all_schemas(self.protocol)
+                collector = StreamCollector()
+                executor = StreamingExecutor()
+                deferred_tool_calls: list[ToolCallComplete] = []
+                llm_stream = self.client.stream(conversation, system=system, tools=tools)
+                async for event in collector.consume(llm_stream):
+                    # 流式工具执行：收到完整 tool_use 就立刻提交执行，不等整个响应结束
+                    if isinstance(event, ToolUseEvent):
+                        tc = collector.response.tool_calls[-1]
+                        # 需要交互式权限确认的工具延迟到流结束后顺序执行
+                        tool = self.registry.get(tc.tool_name)
+                        needs_ask = False
+                        if tool and self.permission_checker:
+                            decision = self.permission_checker.check(tool, tc.arguments)
+                            needs_ask = decision.effect == "ask"
+                        if needs_ask or deferred_tool_calls or not (tool and tool.is_concurrency_safe and tool.is_read_only):
+                            deferred_tool_calls.append(tc)
+                        else:
+                            executor.submit(self._execute_single_tool_direct(tc), tc.tool_id, tc.tool_name)
+                    yield event
 
-            # Layer 2: 接近 context window 上限时自动 compact
-            # Layer 1（工具结果预算）在结果入历史时已处理完，历史里的内容
-            # 就是最终大小，直接用 conversation.history 估算
-            compact_result = await auto_compact(
-                conversation,
-                self.client,
-                self.context_window,
-                self.session_dir,
-                protocol=self.protocol,
-                breaker=self.compact_breaker,
-                recovery=self.recovery_state,
-                tool_schemas=self.registry.get_all_schemas(self.protocol),
-                transcript_path=self._transcript_path,
-            )
-            if isinstance(compact_result, CompactEvent):
-                yield CompactNotification(
-                    before_tokens=compact_result.before_tokens,
-                    message=f"上下文已压缩（压缩前 {compact_result.before_tokens:,} tokens）",
-                    boundary=compact_result.boundary,
+                response = collector.response
+
+                if self.hook_engine:
+                    ctx = self._build_hook_context("post_receive", message=response.text)
+                    await self.hook_engine.run_hooks("post_receive", ctx)
+                    for he in self._drain_hook_events():
+                        yield he
+
+                if budget:
+                    budget.tokens += response.input_tokens + response.output_tokens + response.cache_read + response.cache_creation
+                self.total_input_tokens += response.input_tokens
+                self.total_output_tokens += response.output_tokens
+                yield UsageEvent(
+                    input_tokens=self.total_input_tokens,
+                    output_tokens=self.total_output_tokens,
                 )
-                conversation.inject_environment(env_context)
-                mem = self.memory_manager.load() if self.memory_manager else ""
-                conversation.inject_long_term_memory(
-                    self.instructions_content, mem
-                )
-                self._sync_evolution_guidance(conversation)
-            elif isinstance(compact_result, str):
-                yield ErrorEvent(message=compact_result)
+                if budget:
+                    budget.check()
 
-            collector = StreamCollector()
-            executor = StreamingExecutor()
-            deferred_tool_calls: list[ToolCallComplete] = []
-            llm_stream = self.client.stream(conversation, system=system, tools=tools)
-            async for event in collector.consume(llm_stream):
-                # 流式工具执行：收到完整 tool_use 就立刻提交执行，不等整个响应结束
-                if isinstance(event, ToolUseEvent):
-                    tc = collector.response.tool_calls[-1]
-                    # 需要交互式权限确认的工具延迟到流结束后顺序执行
-                    tool = self.registry.get(tc.tool_name)
-                    needs_ask = False
-                    if tool and self.permission_checker:
-                        decision = self.permission_checker.check(tool, tc.arguments)
-                        needs_ask = decision.effect == "ask"
-                    if needs_ask:
-                        deferred_tool_calls.append(tc)
-                    else:
-                        executor.submit(self._execute_single_tool_direct(tc))
-                yield event
+                conv_thinking = [
+                    ConvThinkingBlock(thinking=tb.thinking, signature=tb.signature)
+                    for tb in response.thinking_blocks
+                ]
 
-            response = collector.response
-
-            if self.hook_engine:
-                ctx = self._build_hook_context("post_receive", message=response.text)
-                await self.hook_engine.run_hooks("post_receive", ctx)
-                for he in self._drain_hook_events():
-                    yield he
-
-            self.total_input_tokens += response.input_tokens
-            self.total_output_tokens += response.output_tokens
-            yield UsageEvent(
-                input_tokens=self.total_input_tokens,
-                output_tokens=self.total_output_tokens,
-            )
-
-            conv_thinking = [
-                ConvThinkingBlock(thinking=tb.thinking, signature=tb.signature)
-                for tb in response.thinking_blocks
-            ]
-
-            if response.stop_reason == "max_tokens":
-                if not max_tokens_escalated:
-                    self.client.set_max_output_tokens(MAX_TOKENS_CEILING)
-                    max_tokens_escalated = True
-                    if response.text:
+                if response.stop_reason == "max_tokens" and not response.tool_calls:
+                    if not max_tokens_escalated:
+                        self.client.set_max_output_tokens(MAX_TOKENS_CEILING)
+                        max_tokens_escalated = True
+                        if response.text:
+                            conversation.add_assistant_message(
+                                response.text, thinking_blocks=conv_thinking
+                            )
+                            conversation.add_user_message(
+                                "Output token limit hit. Resume directly from where you stopped. "
+                                "Do not apologize or repeat previous content. Pick up mid-thought if needed."
+                            )
+                        yield RetryEvent(reason="max_tokens escalation")
+                        continue
+                    elif output_recoveries < MAX_OUTPUT_TOKENS_RECOVERIES:
+                        output_recoveries += 1
                         conversation.add_assistant_message(
                             response.text, thinking_blocks=conv_thinking
                         )
                         conversation.add_user_message(
                             "Output token limit hit. Resume directly from where you stopped. "
-                            "Do not apologize or repeat previous content. Pick up mid-thought if needed."
+                            "Break remaining work into smaller pieces."
                         )
-                    yield RetryEvent(reason="max_tokens escalation")
-                    continue
-                elif output_recoveries < MAX_OUTPUT_TOKENS_RECOVERIES:
-                    output_recoveries += 1
+                        yield RetryEvent(
+                            reason=f"max_tokens recovery {output_recoveries}/{MAX_OUTPUT_TOKENS_RECOVERIES}"
+                        )
+                        continue
+                else:
+                    output_recoveries = 0
+
+                if response.stop_reason == "max_tokens" and not response.tool_calls:
+                    conversation.add_assistant_message(response.text, thinking_blocks=conv_thinking)
+                    yield ErrorEvent(message="模型输出持续被截断，已停止自动重试")
+                    return
+
+                if not response.tool_calls:
                     conversation.add_assistant_message(
                         response.text, thinking_blocks=conv_thinking
                     )
-                    conversation.add_user_message(
-                        "Output token limit hit. Resume directly from where you stopped. "
-                        "Break remaining work into smaller pieces."
-                    )
-                    yield RetryEvent(
-                        reason=f"max_tokens recovery {output_recoveries}/{MAX_OUTPUT_TOKENS_RECOVERIES}"
-                    )
-                    continue
-            else:
-                output_recoveries = 0
+                    self._loop_count += 1
+                    if (
+                        self._loop_count % MEMORY_EXTRACTION_INTERVAL == 0
+                        and self.memory_manager
+                    ):
+                        task = asyncio.create_task(self._extract_memories(conversation))
+                        self._memory_extraction_tasks.add(task)
+                        task.add_done_callback(self._memory_extraction_tasks.discard)
+                    if self._consolidator is not None:
+                        asyncio.ensure_future(
+                            self._consolidator.maybe_run(self.client, conversation, self.protocol)
+                        )
+                    if self.hook_engine:
+                        ctx = self._build_hook_context("turn_end")
+                        await self.hook_engine.run_hooks("turn_end", ctx)
+                        ctx = self._build_hook_context("session_end")
+                        await self.hook_engine.run_hooks("session_end", ctx)
+                        for he in self._drain_hook_events():
+                            yield he
+                    if self.file_history is not None:
+                        summary = response.text[:60] + "..." if len(response.text) > 60 else response.text
+                        self.file_history.make_snapshot(len(conversation.history), summary)
+                    yield LoopComplete(total_turns=iteration)
+                    break
 
-            if not response.tool_calls:
-                conversation.add_assistant_message(
-                    response.text, thinking_blocks=conv_thinking
-                )
-                self._loop_count += 1
-                if (
-                    self._loop_count % MEMORY_EXTRACTION_INTERVAL == 0
-                    and self.memory_manager
-                ):
-                    task = asyncio.create_task(self._extract_memories(conversation))
-                    self._memory_extraction_tasks.add(task)
-                    task.add_done_callback(self._memory_extraction_tasks.discard)
-                if self._consolidator is not None:
-                    asyncio.ensure_future(
-                        self._consolidator.maybe_run(self.client, conversation, self.protocol)
+                tool_uses = [
+                    ToolUseBlock(
+                        tool_use_id=tc.tool_id,
+                        tool_name=tc.tool_name,
+                        arguments=tc.arguments,
                     )
+                    for tc in response.tool_calls
+                ]
+                conversation.add_assistant_message(
+                    response.text, tool_uses, thinking_blocks=conv_thinking
+                )
+                # 在 assistant 回复加入历史后锚定实际用量：基线（input + cache + output）
+                # 覆盖到当前位置，因此下一轮迭代顶部的 auto-compact 检查只需对
+                # 接下来追加的 tool results 做字符估算。
+                conversation.record_usage_anchor(
+                    response.input_tokens,
+                    response.output_tokens,
+                    response.cache_read,
+                    response.cache_creation,
+                )
+
+                # 溢写文件的回读结果豁免溢写：把模型刚读回来的内容再写盘换成
+                # 预览，模型就永远看不到全文，还会在「读回、溢写」之间打转
+                exempt_ids = {
+                    tc.tool_id
+                    for tc in response.tool_calls
+                    if is_spill_readback(tc.tool_name, tc.arguments, self.session_dir)
+                }
+
+                # 收集流式执行器中已提交的工具结果（工具在 LLM 流式输出期间已开始执行）
+                tool_results: list[ToolResultBlock] = []
+                streaming_results = await executor.collect_results()
+
+                for br in streaming_results:
+                    content = self._maybe_persist_or_truncate(
+                        br.tool_id, br.result.output, exempt_ids
+                    )
+                    tool_results.append(
+                        ToolResultBlock(
+                            tool_use_id=br.tool_id,
+                            content=content,
+                            is_error=br.result.is_error,
+                        )
+                    )
+                    yield ToolResultEvent(
+                        tool_id=br.tool_id,
+                        tool_name=br.tool_name,
+                        output=br.result.output,
+                        is_error=br.result.is_error,
+                        elapsed=br.elapsed,
+                    )
+
+                # 需要交互式权限确认的工具，在流结束后顺序执行
+                for tc in deferred_tool_calls:
+                    result: ToolResult | None = None
+                    elapsed = 0.0
+
+                    async for item in self._execute_tool(tc):
+                        if isinstance(item, PermissionRequest):
+                            yield item
+                        else:
+                            result, elapsed = item
+
+                    if result is None:
+                        result = ToolResult(output="Error: no result from tool", is_error=True)
+
+                    content = self._maybe_persist_or_truncate(
+                        tc.tool_id, result.output, exempt_ids
+                    )
+                    tool_results.append(
+                        ToolResultBlock(
+                            tool_use_id=tc.tool_id,
+                            content=content,
+                            is_error=result.is_error,
+                        )
+                    )
+                    yield ToolResultEvent(
+                        tool_id=tc.tool_id,
+                        tool_name=tc.tool_name,
+                        output=result.output,
+                        is_error=result.is_error,
+                        elapsed=elapsed,
+                    )
+
+                exit_plan_called = any(
+                    tc.tool_name == "ExitPlanMode" for tc in response.tool_calls
+                )
+                # 聚合预算：一轮并行工具的结果落在同一条消息里，单条阈值管不住
+                # 合计超限的情况。进历史前把整批处理完，消息一出生就是终态
+                apply_tool_result_budget(tool_results, self.session_dir, exempt_ids)
+                conversation.add_tool_results_message(tool_results)
+
+                # 非阻塞 memory recall：工具执行完后检查 prefetch 是否就绪
+                if self.memory_recall_task and not self._memory_recall_consumed:
+                    if self.memory_recall_task.done():
+                        try:
+                            recall = self.memory_recall_task.result()
+                            if recall:
+                                conversation.add_system_reminder(recall)
+                        except Exception:
+                            pass
+                        self._memory_recall_consumed = True
+
+                if exit_plan_called:
+                    yield TurnComplete(turn=iteration)
+                    yield LoopComplete(total_turns=iteration)
+                    break
+
                 if self.hook_engine:
                     ctx = self._build_hook_context("turn_end")
                     await self.hook_engine.run_hooks("turn_end", ctx)
-                    ctx = self._build_hook_context("session_end")
-                    await self.hook_engine.run_hooks("session_end", ctx)
                     for he in self._drain_hook_events():
                         yield he
-                if self.file_history is not None:
-                    summary = response.text[:60] + "..." if len(response.text) > 60 else response.text
-                    self.file_history.make_snapshot(len(conversation.history), summary)
-                yield LoopComplete(total_turns=iteration)
-                break
-
-            tool_uses = [
-                ToolUseBlock(
-                    tool_use_id=tc.tool_id,
-                    tool_name=tc.tool_name,
-                    arguments=tc.arguments,
-                )
-                for tc in response.tool_calls
-            ]
-            conversation.add_assistant_message(
-                response.text, tool_uses, thinking_blocks=conv_thinking
-            )
-            # 在 assistant 回复加入历史后锚定实际用量：基线（input + cache + output）
-            # 覆盖到当前位置，因此下一轮迭代顶部的 auto-compact 检查只需对
-            # 接下来追加的 tool results 做字符估算。
-            conversation.record_usage_anchor(
-                response.input_tokens,
-                response.output_tokens,
-                response.cache_read,
-                response.cache_creation,
-            )
-
-            # 溢写文件的回读结果豁免溢写：把模型刚读回来的内容再写盘换成
-            # 预览，模型就永远看不到全文，还会在「读回、溢写」之间打转
-            exempt_ids = {
-                tc.tool_id
-                for tc in response.tool_calls
-                if is_spill_readback(tc.tool_name, tc.arguments, self.session_dir)
-            }
-
-            # 收集流式执行器中已提交的工具结果（工具在 LLM 流式输出期间已开始执行）
-            tool_results: list[ToolResultBlock] = []
-            streaming_results = await executor.collect_results()
-
-            for br in streaming_results:
-                content = self._maybe_persist_or_truncate(
-                    br.tool_id, br.result.output, exempt_ids
-                )
-                tool_results.append(
-                    ToolResultBlock(
-                        tool_use_id=br.tool_id,
-                        content=content,
-                        is_error=br.result.is_error,
-                    )
-                )
-                yield ToolResultEvent(
-                    tool_id=br.tool_id,
-                    tool_name=br.tool_name,
-                    output=br.result.output,
-                    is_error=br.result.is_error,
-                    elapsed=br.elapsed,
-                )
-
-            # 需要交互式权限确认的工具，在流结束后顺序执行
-            for tc in deferred_tool_calls:
-                result: ToolResult | None = None
-                elapsed = 0.0
-
-                async for item in self._execute_tool(tc):
-                    if isinstance(item, PermissionRequest):
-                        yield item
-                    else:
-                        result, elapsed = item
-
-                if result is None:
-                    result = ToolResult(output="Error: no result from tool", is_error=True)
-
-                content = self._maybe_persist_or_truncate(
-                    tc.tool_id, result.output, exempt_ids
-                )
-                tool_results.append(
-                    ToolResultBlock(
-                        tool_use_id=tc.tool_id,
-                        content=content,
-                        is_error=result.is_error,
-                    )
-                )
-                yield ToolResultEvent(
-                    tool_id=tc.tool_id,
-                    tool_name=tc.tool_name,
-                    output=result.output,
-                    is_error=result.is_error,
-                    elapsed=elapsed,
-                )
-
-            exit_plan_called = any(
-                tc.tool_name == "ExitPlanMode" for tc in response.tool_calls
-            )
-            # 聚合预算：一轮并行工具的结果落在同一条消息里，单条阈值管不住
-            # 合计超限的情况。进历史前把整批处理完，消息一出生就是终态
-            apply_tool_result_budget(tool_results, self.session_dir, exempt_ids)
-            conversation.add_tool_results_message(tool_results)
-
-            # 非阻塞 memory recall：工具执行完后检查 prefetch 是否就绪
-            if self.memory_recall_task and not self._memory_recall_consumed:
-                if self.memory_recall_task.done():
-                    try:
-                        recall = self.memory_recall_task.result()
-                        if recall:
-                            conversation.add_system_reminder(recall)
-                    except Exception:
-                        pass
-                    self._memory_recall_consumed = True
-
-            if exit_plan_called:
                 yield TurnComplete(turn=iteration)
-                yield LoopComplete(total_turns=iteration)
-                break
 
-            if self.hook_engine:
-                ctx = self._build_hook_context("turn_end")
-                await self.hook_engine.run_hooks("turn_end", ctx)
-                for he in self._drain_hook_events():
-                    yield he
-            yield TurnComplete(turn=iteration)
-
+        finally:
+            try:
+                if executor is not None:
+                    await executor.cancel()
+            finally:
+                close_stream = getattr(llm_stream, "aclose", None)
+                if close_stream:
+                    await close_stream()
 
     def _consume_mailbox(self, conversation: ConversationManager) -> None:
         if not self.team_name or not self._team_manager:
@@ -840,6 +901,11 @@ class Agent:
     async def _execute_single_tool_direct(
         self, tc: ToolCallComplete
     ) -> _ToolExecResult:
+        budget = current_budget.get()
+        if budget:
+            budget.claim_tool(tc)
+        from nonocode.execution import tool_started
+        tool_started(tc)
         tool = self.registry.get(tc.tool_name)
         start = time.monotonic()
 
@@ -885,6 +951,8 @@ class Agent:
         except Exception as e:
             result = ToolResult(output=f"Tool execution error: {e}", is_error=True)
 
+        from nonocode.execution import record_tool
+        await record_tool(tc, result, time.monotonic()-start)
         await self._run_post_tool_hook(tc)
         self._snapshot_for_recovery(tc, result)
 
@@ -905,6 +973,11 @@ class Agent:
     async def _execute_tool(
         self, tc: ToolCallComplete
     ) -> AsyncIterator[tuple[ToolResult, float]]:
+        budget = current_budget.get()
+        if budget:
+            budget.claim_tool(tc)
+        from nonocode.execution import tool_started
+        tool_started(tc)
         tool = self.registry.get(tc.tool_name)
         start = time.monotonic()
 
@@ -987,6 +1060,8 @@ class Agent:
                 output=f"Tool execution error: {e}", is_error=True
             )
 
+        from nonocode.execution import record_tool
+        await record_tool(tc, result, time.monotonic()-start)
         await self._run_post_tool_hook(tc)
         self._snapshot_for_recovery(tc, result)
 
@@ -1087,10 +1162,28 @@ class Agent:
             )
         return ErrorEvent(message=result or "压缩失败：对话历史为空或未达到压缩条件")
 
-    async def run_to_completion(
+    async def run_to_completion(self, task: str, conversation=None, event_callback=None) -> str:
+        from nonocode.execution import agent_scope
+        async with agent_scope(self, task):
+            return await self._limited_completion(task, conversation, event_callback)
+
+    async def _limited_completion(self, task: str, conversation=None, event_callback=None) -> str:
+        from nonocode.limits import RunBudget
+        budget = RunBudget(self.run_limits)
+        token = current_budget.set(budget)
+        try:
+            async with asyncio.timeout(self.run_limits.max_seconds or None):
+                return await self._run_to_completion(task, conversation, event_callback)
+        except TimeoutError:
+            raise RunLimitError(f"执行已停止：达到 run_limits.max_seconds={self.run_limits.max_seconds}") from None
+        finally:
+            current_budget.reset(token)
+
+    async def _run_to_completion(
         self, task: str, conversation: ConversationManager | None = None,
         event_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> str:
+        env_context = build_environment_context(self.work_dir, self.active_skills, self._skill_catalog, self._agent_catalog)
         if conversation is None:
             conversation = ConversationManager()
 
@@ -1129,8 +1222,13 @@ class Agent:
         iteration = 0
         while True:
             iteration += 1
+            from nonocode.execution import iteration_started
+            iteration_started()
+            budget = current_budget.get()
+            if budget:
+                budget.check(iteration)
             if self.max_iterations > 0 and iteration > self.max_iterations:
-                break
+                raise RunLimitError(f"Agent reached maximum iterations ({self.max_iterations})")
             if self.hook_engine:
                 ctx = self._build_hook_context("turn_start")
                 await self.hook_engine.run_hooks("turn_start", ctx)
@@ -1166,12 +1264,21 @@ class Agent:
 
             collector = StreamCollector()
             llm_stream = self.client.stream(conversation, system=system, tools=tools)
-            async for _event in collector.consume(llm_stream):
-                pass
+            try:
+                async for _event in collector.consume(llm_stream):
+                    pass
+            finally:
+                close_stream = getattr(llm_stream, "aclose", None)
+                if close_stream:
+                    await close_stream()
 
             response = collector.response
+            if budget:
+                budget.tokens += response.input_tokens + response.output_tokens + response.cache_read + response.cache_creation
             self.total_input_tokens += response.input_tokens
             self.total_output_tokens += response.output_tokens
+            if budget:
+                budget.check()
 
             if event_callback:
                 event_callback({
@@ -1263,6 +1370,12 @@ class Agent:
     async def _execute_tool_noninteractive(
         self, tc: ToolCallComplete
     ) -> ToolResult:
+        budget = current_budget.get()
+        if budget:
+            budget.claim_tool(tc)
+        from nonocode.execution import tool_started
+        tool_started(tc)
+        start = time.monotonic()
         tool = self.registry.get(tc.tool_name)
 
         if tool is None:
@@ -1308,6 +1421,8 @@ class Agent:
                 output=f"Tool execution error: {e}", is_error=True
             )
 
+        from nonocode.execution import record_tool
+        await record_tool(tc, result, time.monotonic()-start)
         await self._run_post_tool_hook(tc)
 
         return result

@@ -151,7 +151,9 @@ class ConversationManager:
         self, instructions: str, memories: str
     ) -> None:
         if self.ltm_injected:
-            return
+            marker='<system-reminder>\nAs you answer the user'
+            self.history=[message for message in self.history if not (message.role=='user' and message.content.startswith(marker))]
+            self.ltm_injected=False
         sections: list[str] = []
         if instructions:
             sections.append(

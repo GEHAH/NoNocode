@@ -25,7 +25,7 @@ def setup_task(tmp_path, *, checks=None):
     atomic_json(tmp_path / "task.json", spec)
     TaskStore(str(tmp_path)).register("task.json")
     store = EvolutionStore(str(tmp_path))
-    item = store.create(RULE, kind="capability")
+    item = store.create(RULE, kind="capability", verification_policy="paired-v1")
     parent = SimpleNamespace(client=DemoClient(), protocol="openai-compat", work_dir=str(tmp_path),
                              instructions_content="", context_window=128000)
     return store, item, parent
@@ -259,7 +259,7 @@ def test_iteration_limit_cannot_produce_a_passing_run(tmp_path):
     parent.client = NeverFinishes()
     report = asyncio.run(VerificationEngine(parent, store).verify(item["id"], ["ledger"]))
     assert report["outcome"] == "error"
-    assert all("maximum iterations" in run["error"] for run in report["runs"])
+    assert all("maximum iterations" in run["error"] or "连续调用" in run["error"] for run in report["runs"])
 
 
 def test_commands_register_verify_report_apply_and_revoke(tmp_path):

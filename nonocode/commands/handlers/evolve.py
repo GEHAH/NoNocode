@@ -52,7 +52,8 @@ async def handle_evolve(ctx: CommandContext) -> None:
             args = shlex.split(arg)
             if len(args) < 2:
                 raise ValueError("用法：/evolve verify <候选完整ID> <任务ID...>")
-            report = await VerificationEngine(ctx.agent, store).verify(args[0], args[1:], ctx.ui.add_system_message)
+            from nonocode.evolution.lab import EvolutionLab
+            report = await EvolutionLab(ctx.agent,getattr(getattr(ctx,"session_manager",None),"database",None),getattr(ctx.agent,"session_id","")).verify(args[0],args[1:],ctx.ui.add_system_message)
             message = (f"执行验证：{report['outcome']}\n{report['reason']}\n"
                        f"任务执行 {len(report['runs'])} 次；模型用量 {report['input_tokens']} 输入 / "
                        f"{report['output_tokens']} 输出 tokens。\n"

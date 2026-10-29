@@ -390,3 +390,69 @@ async def test_remote_database_failure_is_visible_and_unblocks_next_message(remo
                for call in remote._broadcast.call_args_list)
     await remote._handle_user_message('Next message')
     assert remote.conversation.history[-1].content == 'Test reply'
+
+
+@pytest.mark.asyncio
+async def test_remote_reconnect_restores_output_and_pending_permission(remote,tmp_path):
+    import json
+    from types import MethodType
+    import websockets
+    from nonocode.remote import RemoteServer
+    from nonocode.agent import PermissionRequest, LoopComplete, StreamText
+    remote._broadcast = MethodType(RemoteServer._broadcast,remote)
+    request = None
+    completed=asyncio.Event()
+    class Agent:
+        total_input_tokens=0;total_output_tokens=0
+        async def run(self,conversation):
+            nonlocal request
+            yield StreamText('Before disconnect')
+            request=asyncio.get_running_loop().create_future()
+            yield PermissionRequest('Bash','Review the command',request)
+            await request
+            completed.set()
+            yield LoopComplete(1)
+    remote.agent=Agent()
+    async def receive(ws,kind):
+        async with asyncio.timeout(5):
+            while True:
+                event=json.loads(await ws.recv())
+                if event['type']==kind:return event['data']
+    async with websockets.serve(remote._ws_handler,'127.0.0.1',0,process_request=remote._process_http_request) as listener:
+        url=f'ws://127.0.0.1:{listener.sockets[0].getsockname()[1]}/ws'
+        async with websockets.connect(url) as first:
+            initial=await receive(first,'state_sync')
+            assert initial['streaming'] is False
+            await first.send(json.dumps({'type':'user_message','data':{'content':'Reconnect test'}}))
+            original=await receive(first,'permission_request')
+        assert not request.done() # Disconnect does not approve, deny or restart work.
+        async with websockets.connect(url) as second:
+            snapshot=await receive(second,'state_sync')
+            assert snapshot['streaming'] and snapshot['runId']
+            assert snapshot['permissions']==[original]
+            assert any(e['type']=='stream_text' and e['data']['text']=='Before disconnect' for e in snapshot['events'])
+            assert any(e['type']=='replay_user' for e in snapshot['events'])
+            await second.send(json.dumps({'type':'permission_response','data':{'id':original['id'],'response':'allow'}}))
+            await receive(second,'loop_complete')
+            assert completed.is_set() and not remote._streaming
+        async with websockets.connect(url) as third:
+            final=await receive(third,'state_sync')
+            assert final['streaming'] is False and final['permissions']==[]
+            assert sum(e['type']=='loop_complete' for e in final['events'])==1
+
+
+@pytest.mark.asyncio
+async def test_new_websocket_does_not_broadcast_connected_to_existing_clients(remote):
+    import json
+    from types import MethodType
+    import websockets
+    from nonocode.remote import RemoteServer
+    remote._broadcast=MethodType(RemoteServer._broadcast,remote)
+    async with websockets.serve(remote._ws_handler,'127.0.0.1',0) as listener:
+        url=f'ws://127.0.0.1:{listener.sockets[0].getsockname()[1]}/ws'
+        async with websockets.connect(url) as one:
+            for _ in range(3):await one.recv()
+            async with websockets.connect(url) as two:
+                for _ in range(3):await two.recv()
+                await one.send(json.dumps({'type':'ping'}))
+                assert json.loads(await one.recv())['type']=='pong'

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
@@ -13,8 +12,8 @@ if TYPE_CHECKING:
 
 class Params(BaseModel):
     file_path: str = Field(description="Absolute or relative path to the file to read")
-    offset: int = Field(default=0, description="Line offset to start reading from (0-based)")
-    limit: int = Field(default=2000, description="Maximum number of lines to read")
+    offset: int = Field(default=0, ge=0, description="Line offset to start reading from (0-based)")
+    limit: int = Field(default=2000, ge=1, le=5000, description="Maximum number of lines to read")
 
 
 class ReadFile(Tool):
@@ -30,27 +29,8 @@ class ReadFile(Tool):
 
 
     async def execute(self, params: Params) -> ToolResult:
-        path = Path(params.file_path)
-        if not path.exists():
-            return ToolResult(output=f"Error: file not found: {params.file_path}", is_error=True)
-        if not path.is_file():
-            return ToolResult(output=f"Error: not a file: {params.file_path}", is_error=True)
-
-        resolved = str(path.resolve())
-
-        try:
-            text = path.read_text(encoding="utf-8")
-        except Exception as e:
-            return ToolResult(output=f"Error reading file: {e}", is_error=True)
-
-        if self._state_cache:
-            try:
-                mtime_ns = path.stat().st_mtime_ns
-                self._state_cache.record(resolved, mtime_ns)
-            except OSError:
-                pass
-
-        lines = text.splitlines()
-        selected = lines[params.offset : params.offset + params.limit]
-        numbered = [f"{i + params.offset + 1}\t{line}" for i, line in enumerate(selected)]
-        return ToolResult(output="\n".join(numbered))
+        from nonocode.tools.isolated import filesystem_worker
+        data = await filesystem_worker('_file_reader.py', params.file_path, str(params.offset), str(params.limit))
+        if self._state_cache and not data.get('is_error'):
+            self._state_cache.record(data['resolved'], data['mtime_ns'])
+        return ToolResult(output=data['output'], is_error=data.get('is_error', False))

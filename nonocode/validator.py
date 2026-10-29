@@ -60,6 +60,16 @@ def validate_providers(raw_providers: list) -> list[dict]:
         if missing:
             raise ConfigError(f"Provider #{i + 1}: missing fields: {', '.join(missing)}")
 
+        for key in ('name','protocol','base_url','model'):
+            if not isinstance(entry[key],str) or not entry[key].strip():
+                raise ConfigError(f"Provider #{i+1}: {key} must be a non-empty string")
+        if not isinstance(entry.get('api_key',''),str):raise ConfigError('api_key must be a string')
+        from urllib.parse import urlsplit
+        try:
+            url=urlsplit(entry['base_url'])
+            if url.scheme not in {'http','https'} or not url.hostname or url.username or url.password or url.fragment:
+                raise ValueError()
+        except ValueError:raise ConfigError('base_url must be an HTTP/HTTPS API endpoint without embedded credentials')
         protocol = entry["protocol"]
         if protocol not in VALID_PROTOCOLS:
             raise ConfigError(
@@ -97,9 +107,12 @@ def validate_providers(raw_providers: list) -> list[dict]:
                 "thinking": thinking,
                 "context_window": context_window,
                 "max_output_tokens": max_output_tokens,
+                "pricing": validate_pricing(entry.get("pricing")),
             }
         )
 
+    if len({provider["name"] for provider in providers}) != len(providers):
+        raise ConfigError("Provider names must be unique")
     return providers
 
 
@@ -236,7 +249,7 @@ def validate_sandbox(raw_sb: dict | None) -> dict:
     return result
 
 
-def validate_config_structure(raw: object) -> dict:
+def validate_config_structure(raw: object, *, partial: bool = False) -> dict:
     """校验的主入口。校验解析后的原始配置，返回清洗后的字典。
 
     返回的字典包含以下键：
@@ -244,11 +257,11 @@ def validate_config_structure(raw: object) -> dict:
         enable_fork、enable_verification_agent、worktree、
         teammate_mode、enable_coordinator_mode、sandbox
     """
-    if not isinstance(raw, dict) or "providers" not in raw:
+    if not isinstance(raw, dict) or ("providers" not in raw and not partial):
         raise ConfigError("Config must contain a 'providers' list")
 
     return {
-        "providers": validate_providers(raw["providers"]),
+        "providers": validate_providers(raw["providers"]) if "providers" in raw else [],
         "permission_mode": validate_permission_mode(raw.get("permission_mode", "default")),
         "mcp_servers": validate_mcp_servers(raw.get("mcp_servers")),
         "hooks": validate_hooks(raw.get("hooks")),
@@ -262,4 +275,67 @@ def validate_config_structure(raw: object) -> dict:
             raw.get("enable_coordinator_mode", False), "enable_coordinator_mode"
         ),
         "sandbox": validate_sandbox(raw.get("sandbox")),
+        "run_limits": validate_run_limits(raw.get("run_limits")),
+        "web": validate_web(raw.get("web")),
     }
+
+
+def validate_run_limits(raw):
+    from dataclasses import asdict
+    from nonocode.limits import RunLimits
+    result = asdict(RunLimits())
+    if raw is None:
+        return result
+    if not isinstance(raw, dict):
+        raise ConfigError("'run_limits' must be a mapping")
+    for key, value in raw.items():
+        if key not in result:
+            raise ConfigError(f"Unknown run_limits field: {key}")
+        if key == 'budget_timezone':
+            from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+            try: ZoneInfo(value)
+            except (ZoneInfoNotFoundError, TypeError, ValueError): raise ConfigError('run_limits.budget_timezone is invalid')
+            result[key] = value
+            continue
+        numeric = (int, float) if key in {'max_cost_usd', 'max_daily_cost_usd'} else (int,)
+        import math
+        if isinstance(value, bool) or not isinstance(value, numeric) or not math.isfinite(value) or value < 0:
+            raise ConfigError(f"run_limits.{key} must be a non-negative number (0 disables)")
+        result[key] = value
+    return result
+
+
+def validate_web(raw):
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError("'web' must be a mapping")
+    for key, value in raw.items():
+        if key not in {'search_provider', 'search_api_key_env', 'enabled'}:
+            raise ConfigError(f'Unknown web field: {key}')
+        if key == 'enabled':
+            if not isinstance(value, bool):
+                raise ConfigError('web.enabled must be a boolean')
+        elif not isinstance(value, str) or not value:
+            raise ConfigError(f'web.{key} must be a non-empty string')
+    if raw.get('search_provider', 'bing') not in {'bing', 'brave'}:
+        raise ConfigError('web.search_provider must be bing or brave')
+    return dict(raw)
+
+
+def validate_pricing(raw):
+    if raw is None: return {}
+    if not isinstance(raw, dict): raise ConfigError('pricing must be a mapping')
+    allowed={'input_per_million','output_per_million','cache_read_per_million','cache_creation_per_million','as_of'}
+    if set(raw)-allowed: raise ConfigError('Unknown pricing field')
+    import math
+    for key,value in raw.items():
+        if key=='as_of':
+            from datetime import date
+            try: date.fromisoformat(value)
+            except (TypeError, ValueError): raise ConfigError('pricing.as_of must be YYYY-MM-DD')
+        elif isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value) or value<0:
+            raise ConfigError('pricing rates must be non-negative numbers')
+    if raw and not {'input_per_million','output_per_million','as_of'} <= set(raw):
+        raise ConfigError('pricing requires input_per_million, output_per_million and as_of')
+    return dict(raw)

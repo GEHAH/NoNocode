@@ -603,8 +603,11 @@ class NoNocodeApp(App):
         enable_coordinator_mode: bool = False,
         driver_class: type | None = None,
         sandbox_config: Any = None,
+        run_limits: Any = None,
+        web_config: dict | None = None,
     ) -> None:
         super().__init__(driver_class=driver_class)
+        self._run_limits = run_limits
         self.providers = providers
         self._initial_permission_mode = permission_mode
         self._mcp_server_configs = mcp_servers or []
@@ -618,7 +621,7 @@ class NoNocodeApp(App):
         self._sandbox_cfg: SandboxAppConfig = sandbox_config or SandboxAppConfig()
         self.client: LLMClient | None = None
         self.conversation = ConversationManager()
-        self.registry: ToolRegistry = create_default_registry()
+        self.registry: ToolRegistry = create_default_registry(web_config=web_config)
         self.agent: Agent | None = None
         self.mcp_manager: MCPManager | None = None
         self._mcp_init_task: asyncio.Task[None] | None = None
@@ -800,6 +803,7 @@ class NoNocodeApp(App):
             instructions_content=self._instructions_content,
             memory_manager=self.memory_manager,
             hook_engine=self.hook_engine,
+            run_limits=self._run_limits,
         )
         self.agent.file_history = self.file_history
         self.agent.session_id = self.session.session_id

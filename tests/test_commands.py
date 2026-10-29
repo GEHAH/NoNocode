@@ -453,6 +453,7 @@ class TestRegisterAllCommands:
             "session", "mcp", "memory", "permission",
             "sandbox", "rewind", "status", "skill", "history", "runs", "storage", "evolve",
         }
+        expected.update({"artifacts","sources","settings","budget"})
         assert names == expected
 
     def test_no_alias_conflicts(self) -> None:

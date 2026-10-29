@@ -101,6 +101,22 @@ class NetworkError(LLMError):
 
 
 class LLMClient(ABC):
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        stream = cls.__dict__.get('stream')
+        if stream is not None:
+            from functools import wraps
+            from nonocode.execution import metered_stream
+            @wraps(stream)
+            async def wrapped(self, *args, **kwargs):
+                events = metered_stream(self, stream, *args, **kwargs)
+                try:
+                    async for event in events:
+                        yield event
+                finally:
+                    await events.aclose()
+            cls.stream = wrapped
+
     @abstractmethod
     async def stream(
         self,
@@ -125,6 +141,7 @@ def _supports_adaptive_thinking(model: str) -> bool:
 
 class AnthropicClient(LLMClient):
     def __init__(self, config: ProviderConfig) -> None:
+        self._usage_config = config
         self.model = config.model
         self.thinking = config.thinking
         self.max_output_tokens = config.get_max_output_tokens()
@@ -323,6 +340,7 @@ class AnthropicClient(LLMClient):
 
 class OpenAIClient(LLMClient):
     def __init__(self, config: ProviderConfig) -> None:
+        self._usage_config = config
         self.model = config.model
         self.max_output_tokens = config.get_max_output_tokens()
         api_key = config.resolve_api_key()
@@ -456,6 +474,7 @@ class OpenAICompatClient(LLMClient):
     """
 
     def __init__(self, config: ProviderConfig) -> None:
+        self._usage_config = config
         self.model = config.model
         self.max_output_tokens = config.get_max_output_tokens()
         api_key = config.resolve_api_key()

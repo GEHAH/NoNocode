@@ -230,6 +230,8 @@ def _build_entrypoint_section(scope_label: str, entrypoint_path: str) -> str:
     header = f"## {scope_label} {ENTRYPOINT_NAME} (`{entrypoint_path}`)\n"
     try:
         data = Path(entrypoint_path).read_text(encoding="utf-8")
+        from nonocode.memory.provenance import filter_index
+        data = filter_index(data,Path(entrypoint_path).parent)
         if data.strip():
             return header + "\n" + truncate_entrypoint_content(data)
     except OSError:
@@ -358,6 +360,11 @@ class MemoryManager:
             ensure_memory_dir_exists(self._user_mem_dir)
         if self._mem_dir:
             ensure_memory_dir_exists(self._mem_dir)
+        from nonocode.execution import current_execution
+        scope = current_execution.get()
+        if scope:
+            from nonocode.memory.provenance import record_index
+            record_index(scope.database,scope.run_id,[("user",self.user_mem_dir),("project",self.project_mem_dir)])
         return build_memory_prompt(self._user_mem_dir, self._mem_dir)
 
     def load_all(self) -> list[MemoryFile]:
@@ -403,6 +410,8 @@ class MemoryManager:
                     continue
         return "\n".join(entries)
 
+    from nonocode.execution import usage_phase
+    @usage_phase("memory_extraction")
     async def extract(
         self,
         client: Any,
@@ -473,11 +482,11 @@ class MemoryManager:
             "EVOLUTION_FEEDBACK: <one-line rule for future work>\n"
             "EVOLUTION_EVIDENCE: <exact one-line quote from a user message supporting the rule>\n"
             "EVOLUTION_SIGNAL: <preference|correction|success|failure>\n"
-            "EVOLUTION_KIND: <preference for communication style, capability for task procedures or performance claims>\n"
+            "EVOLUTION_KIND: <preference|capability>\n"
             "EVOLUTION_CUE: <when this rule applies; leave empty for a general preference>\n"
             "EVOLUTION_TARGET: <existing lesson ID for the same rule, or leave empty for a new rule>\n"
             "---\n"
-            "Read the existing lessons below. Link paraphrases and later outcome reports to their existing ID. "
+            "Use preference for communication style and capability for procedures or performance claims. Read the existing lessons below. Link paraphrases and later outcome reports to their existing ID. "
             "A contrary preference or revised procedure is a NEW candidate, not evidence supporting the old rule. "
             "Preserve the existing rule when linking; new observations cannot silently rewrite reviewed rules. "
             "Use the existing lesson's kind when linking. Capability proposals require execution verification before adoption. "
@@ -504,7 +513,10 @@ class MemoryManager:
                 if isinstance(event, TextDelta):
                     collected += event.text
                 elif isinstance(event, StreamEnd):
-                    pass
+                    if event.stop_reason in {'max_tokens','length'}:
+                        # Keep the anchor unchanged: a partial memory or rule is
+                        # not reliable evidence and can be retried next turn.
+                        return
         except Exception:
             return
 
@@ -550,12 +562,22 @@ class MemoryManager:
                 continue
             ensure_memory_dir_exists(target_dir)
 
-            content = f"---\nname: {name}\ndescription: {desc}\nmetadata:\n  type: {mtype}\n---\n\n{body}\n"
+            import yaml
+            from nonocode.execution import current_execution
+            execution_scope=current_execution.get()
+            content = '---\n'+yaml.safe_dump({'name':name,'description':desc,'metadata':{'type':mtype},
+                'source':'conversation_extraction','evidence':'\n'.join(user_messages[-3:])[:2000], 'session_id':execution_scope.session_id if execution_scope else ''},allow_unicode=True,sort_keys=False)+'---\n\n'+body+'\n' 
             file_path = Path(target_dir) / f"{name}.md"
             if file_path.is_symlink():
                 continue
             try:
+                if file_path.exists():
+                    from nonocode.memory.provenance import metadata,active
+                    existing_text=file_path.read_text()
+                    if metadata(existing_text).get('source')=='manual' or not active(existing_text):
+                        continue
                 file_path.write_text(content, encoding="utf-8")
+                file_path.chmod(0o600)
             except OSError:
                 continue
 

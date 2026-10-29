@@ -58,8 +58,23 @@ class ProductService:
                 entries.append({'scope': scope,'name': path.stem,'type': metadata.type or 'reference',
                                 'description':metadata.description,'body':body,'path':str(path),
                                 'updated_at':datetime.fromtimestamp(path.stat().st_mtime,timezone.utc).isoformat()})
+        from nonocode.memory.provenance import evidence
+        receipts = {}
+        for item in entries:
+            receipts[(item['scope'],item['name'])] = evidence(self.database,item['scope'],item['name'],Path(item['path']).read_text())
         self.database.index_memories(entries)
-        return self.database.search_memories(query)
+        results = self.database.search_memories(query)
+        for item in results:
+            item.update(receipts.get((item['scope'],item['name']),{}))
+            with self.database.connect() as connection:
+                row = connection.execute('SELECT max(created_at) AS last_used FROM memory_usage WHERE workspace_id=? AND scope=? AND name=?',
+                    (self.database.workspace_id,item['scope'],item['name'])).fetchone()
+            item['last_used_at'] = row['last_used']
+            item['conflicts'] = [other['scope']+'/'+other['name'] for other in entries if other != item
+                and receipts.get((other['scope'],other['name']),{}).get('active')
+                and item.get('topic') and item['topic'] == receipts.get((other['scope'],other['name']),{}).get('topic')
+                and other['body'] != item['body']]
+        return results
 
     def memory(self, scope: str, name: str) -> dict:
         self._path(scope,name)
@@ -69,7 +84,7 @@ class ProductService:
     def _missing():
         raise ValueError('记忆不存在')
 
-    def update_memory(self, scope: str, name: str, body: str, *, create: bool = False) -> dict:
+    def update_memory(self, scope: str, name: str, body: str, *, create: bool = False, evidence: str = "", session_id: str = "", expires_at: str | None = None, enabled: bool | None = None, topic: str | None = None) -> dict:
         if not body.strip() or len(body) > 100_000:
             raise ValueError('记忆内容须为 1–100000 个字符')
         path = self._path(scope,name)
@@ -87,9 +102,31 @@ class ProductService:
             description = name
             kind = 'user' if scope == 'user' else 'project'
             prefix = f'---\nname: {name}\ndescription: {name}\nmetadata:\n  type: {kind}\nsource: manual\n---\n'
+        from nonocode.memory.provenance import metadata
+        import yaml
+        values = metadata(prefix)
+        if session_id:
+            records = self.database.records(session_id)
+            if not evidence or not any(evidence in str(row.get('content','')) for row in records if row.get('role')=='user' and not str(row.get('content','')).startswith('<')):
+                raise ValueError('原话证据必须能在指定会话的用户消息中核对')
+        if len(evidence)>2000: raise ValueError('证据最多 2000 字符')
+        values.update(source='manual',evidence=evidence or body[:2000],session_id=session_id,verified_at=datetime.now(timezone.utc).isoformat())
+        if expires_at is not None:
+            if expires_at:
+                try: datetime.fromisoformat(expires_at.replace('Z','+00:00'))
+                except (ValueError,AttributeError): raise ValueError('过期时间须为 ISO 日期时间')
+            values['expires_at']=expires_at
+        if enabled is not None:
+            if not isinstance(enabled,bool):raise ValueError('enabled 必须为布尔值')
+            values['enabled']=enabled
+        if topic is not None:
+            if not isinstance(topic,str) or len(topic)>100:raise ValueError('主题最多 100 字符')
+            values['topic']=topic
+        prefix='---\n'+yaml.safe_dump(values,allow_unicode=True,sort_keys=False)+'---\n'
         temporary = path.parent / f'.{uuid.uuid4().hex}.tmp'
         try:
             temporary.write_text(prefix+'\n'+body.strip()+'\n',encoding='utf-8')
+            temporary.chmod(0o600)
             os.replace(temporary,path)
         finally:
             temporary.unlink(missing_ok=True)

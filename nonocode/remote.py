@@ -8,6 +8,7 @@ Remote Control 服务器：通过 WebSocket 桥接 Agent 事件和 Web UI。
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import json
 import logging
 import os
@@ -86,6 +87,14 @@ class RemoteServer:
 
         # WebSocket 连接池（支持多客户端广播）
         self._connections: set[ServerConnection] = set()
+        self._broadcast_lock = asyncio.Lock()
+        self._replay_base = None
+        self._event_log = deque()
+        self._event_log_bytes = 0
+        self._replay_truncated = False
+        self._pending_perm_details = {}
+        self._lab_task = None
+        self._lab_job = {}
 
         # Agent 相关状态
         self.agent: Agent | None = None
@@ -141,7 +150,15 @@ class RemoteServer:
             max_size=4 * 1024 * 1024,  # 4MB 消息上限
         ):
             # 服务器启动后永久阻塞
-            await asyncio.Future()
+            try:
+                await asyncio.Future()
+            finally:
+                if self._lab_task and not self._lab_task.done():
+                    self._lab_task.cancel()
+                    await asyncio.gather(self._lab_task,return_exceptions=True)
+                if self._agent_task is not None and self._agent_task is not asyncio.current_task():
+                    self._agent_task.cancel()
+                    await asyncio.gather(self._agent_task, return_exceptions=True)
 
     # ------------------------------------------------------------------
     # HTTP 请求处理（为 / 路径提供前端 HTML）
@@ -178,22 +195,14 @@ class RemoteServer:
 
     async def _ws_handler(self, websocket: ServerConnection) -> None:
         """处理单个 WebSocket 连接的全生命周期。"""
-        self._connections.add(websocket)
         try:
-            # 连接建立时推送会话信息
-            await self._broadcast({
-                "type": "connected",
-                "data": {
-                    "session": self.session_id,
-                    "cwd": os.getcwd(),
-                },
-            })
-
-            # 推送命令列表
-            await self._broadcast({
-                "type": "commands",
-                "data": self._build_command_list(),
-            })
+            # A single lock orders snapshot delivery before live events.
+            async with self._broadcast_lock, asyncio.timeout(10):
+                await websocket.send(json.dumps({"type":"connected", "data":{
+                    "session":self.session_id, "cwd":os.getcwd()}},ensure_ascii=False))
+                await websocket.send(json.dumps({"type":"commands", "data":self._build_command_list()},ensure_ascii=False))
+                await websocket.send(json.dumps({"type":"state_sync", "data":self._state_snapshot()},ensure_ascii=False))
+                self._connections.add(websocket)
 
             # 消息循环
             async for raw in websocket:
@@ -229,6 +238,8 @@ class RemoteServer:
                         self._cancel_event.set()
                     if self._agent_task is not None:
                         self._agent_task.cancel()
+                    if self._lab_task and not self._lab_task.done():
+                        self._lab_task.cancel()
 
                 elif msg_type == "ping":
                     # 应用层保活
@@ -249,14 +260,18 @@ class RemoteServer:
             action = data.get('action','')
             if not isinstance(action,str):
                 raise ValueError('无效操作')
-            if self._streaming and action in {'memory_save','memory_forget','session_resume','session_rename'}:
+            if (self._streaming or (self._lab_task and not self._lab_task.done())) and action in {'backup','memory_save','memory_forget','session_resume','session_rename','settings_save','settings_test','evolution_create','evolution_transition','evolution_task_save','evolution_verify','evolution_restore'}:
                 raise ValueError('请等待或取消当前任务后再修改')
             def string(key, default=''):
                 value = data.get(key,default)
                 if not isinstance(value,str):
                     raise ValueError('字段 '+key+' 必须是文本')
                 return value
-            if action == 'history':
+            if action in {'artifacts','artifact','artifact_diff','artifact_download','sources','source','usage','memory_usage',
+                'settings','settings_save','settings_test','evolution','evolution_create','evolution_transition','evolution_versions',
+                'evolution_restore','evolution_tasks','evolution_task_save','evolution_draft','evolution_verify','evolution_job','evolution_cancel','evolution_report','evolution_trial'}:
+                result = await self._workbench_request(action,data)
+            elif action == 'history':
                 result = await asyncio.to_thread(product.history,string('query'))
             elif action == 'runs':
                 result = await asyncio.to_thread(product.database.list_runs)
@@ -267,7 +282,7 @@ class RemoteServer:
             elif action == 'memories':
                 result = await asyncio.to_thread(product.memory_entries,string('query'))
             elif action == 'memory_save':
-                result = await asyncio.to_thread(product.update_memory,string('scope'),string('name'),string('body'),create=data.get('create') is True)
+                result = await asyncio.to_thread(product.update_memory,string('scope'),string('name'),string('body'),create=data.get('create') is True,evidence=string('evidence'),session_id=string('session_id'),expires_at=data.get('expires_at'),enabled=data.get('enabled'),topic=data.get('topic'))
             elif action == 'memory_forget':
                 await asyncio.to_thread(product.forget_memory,string('scope'),string('name'))
                 result = {'message':'记忆已删除'}
@@ -291,8 +306,9 @@ class RemoteServer:
                     raise ValueError('任务已结束或不属于当前实例')
                 result = {'message':'已请求取消任务'}
             elif action == 'backup':
-                destination = product.database.path.parent / 'backups' / ('nonocode-'+now().replace(':','-')+'.db')
-                result = {'path':str(await asyncio.to_thread(product.database.backup,destination))}
+                from nonocode.storage.recovery import backup_bundle
+                destination = product.database.path.parent / 'backups' / ('nonocode-'+now().replace(':','-')+'.zip')
+                result = {'path':str(await asyncio.to_thread(backup_bundle,product.database,destination))}
             else:
                 raise ValueError('未知操作')
             response.update(ok=True,result=result)
@@ -302,6 +318,97 @@ class RemoteServer:
             log.exception('Product request failed')
             response['error'] = '操作失败，请查看本机日志'
         await websocket.send(json.dumps({'type':'product_result','data':response},ensure_ascii=False))
+
+    async def _workbench_request(self, action, data):
+        from nonocode.storage.products import ProductStore
+        from nonocode.settings import SettingsService
+        from nonocode.evolution.lab import EvolutionLab
+        from nonocode.execution import usage_summary
+        from nonocode.memory.provenance import usage
+        database=self.session_manager.database
+        products=ProductStore(database)
+        settings=SettingsService(database.workspace_path,database)
+        lab=EvolutionLab(self.agent,database,self.session_id)
+        def text(key,default=''):
+            value=data.get(key,default)
+            if not isinstance(value,str):raise ValueError(key+' 必须是文本')
+            return value
+        if action=='artifacts':return await asyncio.to_thread(products.artifacts,text('query'),text('run_id'))
+        if action=='artifact':return await asyncio.to_thread(products.preview,text('id'))
+        if action=='artifact_diff':return await asyncio.to_thread(products.diff,text('id'),text('other_id'))
+        if action=='artifact_download':return await asyncio.to_thread(products.download,text('id'),bundle=data.get('bundle') is True)
+        if action=='sources':return await asyncio.to_thread(products.sources,text('query'),text('run_id'))
+        if action=='source':return await asyncio.to_thread(products.source,text('id'))
+        if action=='usage':return await asyncio.to_thread(usage_summary,database,text('run_id'))
+        if action=='memory_usage':return await asyncio.to_thread(usage,database,text('run_id'))
+        if action=='settings':return await asyncio.to_thread(settings.read)
+        if action=='settings_save':
+            result=await asyncio.to_thread(settings.save,data.get('values'),text('revision'))
+            self._apply_workbench_config(settings.config())
+            result['message']='已保存并应用到后续任务；已有对话保留'
+            return result
+        if action=='settings_test':return await settings.test(data.get('values'),session_id=self.session_id)
+        if action=='evolution':return await asyncio.to_thread(lab.list)
+        if action=='evolution_create':return await asyncio.to_thread(lab.create,text('rule'),text('kind','capability'),text('cue'),text('evidence'),text('replaces_id'))
+        if action=='evolution_transition':return await asyncio.to_thread(lab.transition,text('id'),text('transition'))
+        if action=='evolution_versions':return await asyncio.to_thread(lab.versions,text('id'))
+        if action=='evolution_restore':return await asyncio.to_thread(lab.restore,text('id'),text('version_id'))
+        if action=='evolution_tasks':return await asyncio.to_thread(lab.tasks.list)
+        if action=='evolution_task_save':return await asyncio.to_thread(lab.register_task,data.get('spec'))
+        if action=='evolution_draft':return await asyncio.to_thread(lab.draft_from_run,text('run_id'))
+        if action=='evolution_report':return await asyncio.to_thread(lab.report,text('id'))
+        if action=='evolution_trial':return await asyncio.to_thread(lab.trial,text('id'),data.get('index'),text('artifact_path'))
+        if action=='evolution_cancel':
+            if self._lab_task and not self._lab_task.done():self._lab_task.cancel()
+            return {'message':'已请求取消验证'}
+        if action=='evolution_job':return {key:value for key,value in self._lab_job.items() if key!='task'}
+        if action=='evolution_verify':
+            ids=data.get('task_ids')
+            if not isinstance(ids,list) or any(not isinstance(value,str) for value in ids):raise ValueError('请选择验证任务')
+            candidate_id=text('id');lab.store.get(candidate_id)
+            # Validate before spawning, so form errors are visible immediately.
+            records=[lab.tasks.get(task_id) for task_id in ids]
+            if not 1<=len(ids)<=3 or len(set(ids))!=len(ids):raise ValueError('请选择 1–3 个不同任务')
+            if lab.store.get(candidate_id).get('verification_policy')=='holdout-v1' and {record['spec'].get('split','development') for record in records}!={'development','holdout'}:
+                raise ValueError('请选择至少一个 development 和一个 holdout 任务')
+            self._lab_job={'id':__import__('uuid').uuid4().hex,'status':'running','candidate_id':candidate_id,'progress':'准备验证','run_id':None}
+            def progress(message):
+                from nonocode.execution import current_execution
+                scope=current_execution.get()
+                self._lab_job.update(progress=message,run_id=scope.root_id if scope else None)
+            async def execute():
+                try:
+                    report=await lab.verify(candidate_id,ids,progress)
+                    self._lab_job.update(status='completed',outcome=report['outcome'],report_id=report['id'],run_id=report.get('tracking_run_id'),progress=report['reason'])
+                except asyncio.CancelledError:
+                    self._lab_job.update(status='cancelled',progress='已取消验证；旧的通过结果不会用于采纳')
+                except Exception as exc:
+                    log.exception('Evolution verification failed')
+                    self._lab_job.update(status='failed',progress=str(exc)[:2000])
+            self._lab_task=asyncio.create_task(execute())
+            return dict(self._lab_job)
+        raise ValueError('未知工作台操作')
+
+    def _apply_workbench_config(self, config):
+        if not config.providers:raise ValueError('至少需要一个模型')
+        provider=config.providers[0]
+        client=create_client(provider)
+        self._config=config;self.providers=config.providers
+        self.agent.client=client;self.agent.protocol=provider.protocol
+        self.agent.context_window=provider.get_context_window();self.agent.run_limits=config.run_limits
+        self.agent.permission_checker.mode=PermissionMode(config.permission_mode)
+        self.agent.permission_mode=PermissionMode(config.permission_mode)
+        from nonocode.tools.web import WebSearch,WebFetch
+        for name,tool in [('WebSearch',WebSearch(config.web)),('WebFetch',WebFetch())]:
+            self.registry.register(tool)
+            if config.web.get('enabled',True):self.registry.enable(name)
+            else:self.registry.disable(name)
+        agent_tool=self.registry.get('Agent')
+        if agent_tool is not None:agent_tool._provider_config=provider
+        search=self.registry.get('ToolSearch')
+        if search is not None:search.protocol=provider.protocol
+        executor=getattr(self,'skill_executor',None)
+        if executor is not None:executor.client=client;executor.protocol=provider.protocol
 
     # ------------------------------------------------------------------
     # Agent 初始化（复刻 TUI 的 _select_provider 流程）
@@ -336,7 +443,7 @@ class RemoteServer:
         client = create_client(provider)
 
         # 工具注册表
-        self.registry = create_default_registry()
+        self.registry = create_default_registry(web_config=getattr(self._config, "web", {}))
         self.registry.register(ToolSearchTool(self.registry, protocol=provider.protocol))
 
         # Skill 加载
@@ -356,6 +463,7 @@ class RemoteServer:
             instructions_content=instructions,
             memory_manager=self.memory_manager,
             hook_engine=self.hook_engine,
+            run_limits=getattr(self._config, "run_limits", None),
         )
         self.agent.session_id = self.session_id
         reset_agent_session(self.agent, self.session_id)
@@ -499,10 +607,14 @@ class RemoteServer:
                 if not future.done():
                     future.cancel()
             self._pending_perms.clear()
+            self._pending_perm_details.clear()
             await self._broadcast({'type':'error','data':{'message':f'本地记录保存失败: {exc}'}})
 
     async def _handle_user_message_impl(self, content: str) -> None:
         """处理来自 Web UI 的用户消息或斜杠命令。"""
+        if self._lab_task and not self._lab_task.done():
+            await self._broadcast({'type':'system','data':{'message':'能力验证正在进行；请在进化实验室查看进度或取消后继续对话。'}})
+            return
         if self._streaming and not content.startswith('/'):
             return
 
@@ -517,6 +629,8 @@ class RemoteServer:
         assert self.conversation is not None
         assert self.agent is not None
 
+        self._begin_replay()
+        self._remember_event({"type":"replay_user", "data":{"content":content}})
         self.conversation.add_user_message(content)
         if self.session:
             self.session.append(Message(role="user", content=content))
@@ -536,6 +650,7 @@ class RemoteServer:
                          input_offset=self.agent.total_input_tokens, output_offset=self.agent.total_output_tokens)
         self._current_run_id = run.id
         tracked_events = run.events(self.agent.run(self.conversation))
+        terminal_message = None
         try:
             async for event in tracked_events:
                 # 检查取消信号
@@ -588,6 +703,7 @@ class RemoteServer:
                     # 生成唯一 ID，等待 Web 端回复
                     perm_id = f"perm_{time.time_ns()}"
                     self._pending_perms[perm_id] = event.future
+                    self._pending_perm_details[perm_id] = {"id":perm_id,"toolName":event.tool_name,"description":event.description}
                     await self._broadcast({
                         "type": "permission_request",
                         "data": {
@@ -611,6 +727,8 @@ class RemoteServer:
                     })
 
                 elif isinstance(event, LoopComplete):
+                    if terminal_message and terminal_message.get("type") == "error":
+                        continue
                     history_cursor = self._persist_messages(history_cursor)
                     if stream_buf:
                         await self._broadcast({
@@ -619,13 +737,13 @@ class RemoteServer:
                         })
                         stream_buf = ""
                     elapsed = time.monotonic() - start_time
-                    await self._broadcast({
+                    terminal_message = {
                         "type": "loop_complete",
                         "data": {
                             "totalTurns": event.total_turns,
                             "elapsed": elapsed,
                         },
-                    })
+                    }
 
                 elif isinstance(event, UsageEvent):
                     await self._broadcast({
@@ -637,10 +755,10 @@ class RemoteServer:
                     })
 
                 elif isinstance(event, ErrorEvent):
-                    await self._broadcast({
+                    terminal_message = {
                         "type": "error",
                         "data": {"message": event.message},
-                    })
+                    }
 
                 elif isinstance(event, CompactNotification):
                     if self.session and event.boundary is not None:
@@ -674,17 +792,17 @@ class RemoteServer:
 
         except asyncio.CancelledError:
             run.finish('cancelled','用户取消了本次执行')
-            await self._broadcast({
+            terminal_message = {
                 "type": "error",
                 "data": {"message": "Operation cancelled"},
-            })
+            }
         except Exception as exc:
             run.finish('failed',str(exc))
             log.exception("Agent run error")
-            await self._broadcast({
+            terminal_message = {
                 "type": "error",
                 "data": {"message": str(exc)},
-            })
+            }
         finally:
             await tracked_events.aclose()
             self._persist_messages(history_cursor)
@@ -701,8 +819,15 @@ class RemoteServer:
                 if not future.done():
                     future.cancel()
             self._pending_perms.clear()
+            self._pending_perm_details.clear()
+            await self._broadcast({"type":"run_state", "data":{"streaming":False,"runId":None}})
+            if terminal_message is not None:
+                await self._broadcast(terminal_message)
 
     def cancel_run(self, run_id: str) -> bool:
+        if self._lab_task and not self._lab_task.done() and run_id == self._lab_job.get('run_id'):
+            self._lab_task.cancel()
+            return True
         if run_id != self._current_run_id or self._agent_task is None or self._agent_task.done():
             return False
         self._agent_task.cancel()
@@ -813,6 +938,10 @@ class RemoteServer:
         )
 
     def _set_session(self, session: Session) -> None:
+        self._replay_base = None
+        self._event_log.clear()
+        self._event_log_bytes = 0
+        self._replay_truncated = False
         self._session_token_offset = session.meta.total_tokens
         self.session = session
         self.session_id = session.session_id
@@ -903,6 +1032,7 @@ class RemoteServer:
         response_str = data.get("response", "deny")
 
         future = self._pending_perms.pop(perm_id, None)
+        self._pending_perm_details.pop(perm_id, None)
         if future is None or future.done():
             return
 
@@ -929,19 +1059,57 @@ class RemoteServer:
             })
         return result
 
-    async def _broadcast(self, msg: dict[str, Any]) -> None:
-        """向所有已连接的 WebSocket 客户端广播消息。"""
-        if not self._connections:
+    def _chat_snapshot(self):
+        messages = []
+        for message in (self.conversation.history if self.conversation else []):
+            if message.role in {'user','assistant'} and message.content and not message.content.startswith(('<system-reminder>', '<nonocode-')):
+                messages.append({"type":"replay_user" if message.role == 'user' else "replay_assistant",
+                                 "data":{"content":message.content[:20000]}})
+        return messages[-50:]
+
+    def _begin_replay(self):
+        self._replay_base = self._chat_snapshot()
+        self._event_log.clear()
+        self._event_log_bytes = 0
+        self._replay_truncated = False
+
+    def _remember_event(self, msg):
+        if msg['type'] == 'clear':
+            self._replay_base = []
+            self._event_log.clear()
+            self._event_log_bytes = 0
+            self._replay_truncated = False
             return
-        data = json.dumps(msg, ensure_ascii=False)
-        # 复制集合避免迭代中修改
-        closed = []
-        for ws in list(self._connections):
-            try:
-                await ws.send(data)
-            except websockets.ConnectionClosed:
-                closed.append(ws)
-            except Exception:
-                closed.append(ws)
-        for ws in closed:
-            self._connections.discard(ws)
+        if msg['type'] not in {'replay_user','replay_assistant','stream_text','stream_end','thinking_text',
+            'tool_use','tool_result','loop_complete','turn_complete','usage','error','retry','compact','run_state'}:
+            return
+        size = len(json.dumps(msg, ensure_ascii=False).encode('utf-8'))
+        self._event_log.append((msg,size))
+        self._event_log_bytes += size
+        while self._event_log and (self._event_log_bytes > 1_000_000 or len(self._event_log) > 3000):
+            _, old_size = self._event_log.popleft()
+            self._event_log_bytes -= old_size
+            self._replay_truncated = True
+
+    def _state_snapshot(self):
+        pending = [self._pending_perm_details[key] for key, future in self._pending_perms.items()
+                   if not future.done() and key in self._pending_perm_details]
+        return {"session":self.session_id,"runId":self._current_run_id,"streaming":self._streaming,
+                "history":self._replay_base if self._replay_base is not None else self._chat_snapshot(),
+                "events":[msg for msg,_ in self._event_log], "permissions":pending,
+                "truncated":self._replay_truncated}
+
+    async def _broadcast(self, msg: dict[str, Any]) -> None:
+        async with self._broadcast_lock:
+            self._remember_event(msg)
+            if not self._connections:
+                return
+            data = json.dumps(msg, ensure_ascii=False)
+            async def send(ws):
+                try:
+                    await asyncio.wait_for(ws.send(data), timeout=5)
+                except (Exception, asyncio.CancelledError):
+                    self._connections.discard(ws)
+                    if asyncio.current_task().cancelling():
+                        raise
+            await asyncio.gather(*(send(ws) for ws in list(self._connections)))

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from dataclasses import replace
 from pathlib import Path
 
@@ -63,21 +65,25 @@ async def handle_runs(ctx: CommandContext) -> None:
 async def handle_storage(ctx: CommandContext) -> None:
     database = ctx.session_manager.database
     parts = ctx.args.split(maxsplit=1)
-    if parts and parts[0] == 'backup':
+    if parts and parts[0] in {'backup','backup-full'}:
         if len(parts)<2:
             ctx.ui.add_system_message('用法: /storage backup <新备份文件路径>')
             return
         try:
-            path = database.backup(Path(parts[1]))
-            ctx.ui.add_system_message(f'数据库已备份: {path}')
+            if parts[0] == "backup-full":
+                from nonocode.storage.recovery import backup_bundle
+                path = await asyncio.to_thread(backup_bundle,database,Path(parts[1]))
+            else:
+                path = database.backup(Path(parts[1]))
+            ctx.ui.add_system_message(f'备份已创建: {path}')
         except (ValueError,OSError) as exc:
             ctx.ui.add_system_message(str(exc))
     else:
-        ctx.ui.add_system_message(f'SQLite: {database.path}\n会话、任务保存在数据库；Markdown 记忆使用可重建索引。\n/storage backup <路径> 可创建一致性备份。')
+        ctx.ui.add_system_message(f'SQLite: {database.path}\n会话、任务保存在数据库；Markdown 记忆使用可重建索引。\n/storage backup <路径> 创建数据库备份；/storage backup-full <路径.zip> 包含记忆、进化记录及脱敏配置。')
 
 
 PRODUCT_COMMANDS = [
     Command(name='history',description='搜索历史对话',usage='/history [关键词]',type=CommandType.LOCAL,handler=handle_history),
     Command(name='runs',description='任务中心：执行记录、取消和恢复会话',usage='/runs [list | show|cancel|resume <id>]',type=CommandType.LOCAL,handler=handle_runs),
-    Command(name='storage',description='数据库状态及备份',usage='/storage [backup <路径>]',type=CommandType.LOCAL,handler=handle_storage),
+    Command(name='storage',description='数据库状态及备份',usage='/storage [backup <路径> | backup-full <路径.zip>]',type=CommandType.LOCAL,handler=handle_storage),
 ]

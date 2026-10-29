@@ -134,7 +134,7 @@ class ToolRegistry:
         return schemas
 
 
-def create_default_registry(file_history: Any = None) -> ToolRegistry:
+def create_default_registry(file_history: Any = None, web_config: dict | None = None) -> ToolRegistry:
     from nonocode.tools.bash import Bash
     from nonocode.tools.edit_file import EditFile
     from nonocode.tools.file_state_cache import FileStateCache
@@ -152,4 +152,8 @@ def create_default_registry(file_history: Any = None) -> ToolRegistry:
     registry.register(Bash())
     registry.register(Glob())
     registry.register(Grep())
+    from nonocode.tools.web import WebSearch, WebFetch
+    if (web_config or {}).get("enabled", True):
+        registry.register(WebSearch(web_config))
+        registry.register(WebFetch())
     return registry

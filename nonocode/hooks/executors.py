@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
@@ -12,26 +13,36 @@ log = logging.getLogger(__name__)
 
 async def execute_command(action: Action, ctx: HookContext) -> ActionResult:
     command = ctx.expand(action.command)
-    try:
-        proc = await asyncio.create_subprocess_shell(
+    from nonocode.tools.bash import Bash
+    proc = None
+    spawn = asyncio.create_task(asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-        )
+            start_new_session=(os.name == "posix"),
+        ))
+    try:
+        proc = await asyncio.shield(spawn)
         try:
             stdout, _ = await asyncio.wait_for(
                 proc.communicate(), timeout=action.timeout
             )
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+            await Bash._stop_process(proc)
             return ActionResult(
                 output=f"Command timed out after {action.timeout}s: {command}",
                 success=False,
             )
         output = stdout.decode(errors="replace").strip() if stdout else ""
         return ActionResult(output=output, success=proc.returncode == 0)
+    except asyncio.CancelledError:
+        if proc is None:
+            proc = await spawn
+        await Bash._stop_process(proc)
+        raise
     except Exception as e:
+        if proc is not None:
+            await Bash._stop_process(proc)
         return ActionResult(output=f"Command execution error: {e}", success=False)
 
 

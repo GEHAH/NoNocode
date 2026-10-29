@@ -14,6 +14,8 @@ _RULE_RE = re.compile(r"^(\w+)\((.+)\)$")
 
 _CONTENT_FIELDS: dict[str, str] = {
     "Bash": "command",
+    "WebSearch": "query",
+    "WebFetch": "url",
     "ReadFile": "file_path",
     "WriteFile": "file_path",
     "EditFile": "file_path",

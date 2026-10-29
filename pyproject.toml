@@ -1,6 +1,6 @@
 [project]
 name = "NoNocode"
-version = "0.3.0"
+version = "0.6.0"
 description = "A personal AI assistant with persistent memory and reviewed improvements"
 requires-python = ">=3.11"
 dependencies = [

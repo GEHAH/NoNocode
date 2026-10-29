@@ -7,6 +7,8 @@ from pathlib import Path
 
 import yaml
 
+from .limits import RunLimits
+
 from .validator import (
     ConfigError,
     DEFAULT_CONTEXT_WINDOW,
@@ -39,6 +41,7 @@ class ProviderConfig:
     # 正数表示配置文件里显式指定的覆盖值。
     context_window: int = 0
     max_output_tokens: int = 0
+    pricing: dict = field(default_factory=dict)
     # 运行时 cache，存放从 provider 的 /v1/models 端点自动拉取的 context window
     # （get_context_window 的第 2 层）。通过 set_fetched_context_window() 写入一次；
     # 0 表示"尚未拉取"。不会持久化。
@@ -144,15 +147,19 @@ class AppConfig:
     teammate_mode: str = ""
     enable_coordinator_mode: bool = False
     sandbox: SandboxAppConfig = field(default_factory=SandboxAppConfig)
+    run_limits: RunLimits = field(default_factory=RunLimits)
+    web: dict = field(default_factory=dict)
+    _run_limit_fields: set[str] = field(default_factory=set, repr=False)
+    _specified_fields: set[str] | None = field(default=None, repr=False)
 
 
-def _load_single_file(path: Path) -> AppConfig:
+def _load_single_file(path: Path, *, allow_partial: bool = False) -> AppConfig:
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     except yaml.YAMLError as e:
         raise ConfigError(f"Failed to parse config {path}: {e}") from e
 
-    validated = validate_config_structure(raw)
+    validated = validate_config_structure(raw, partial=allow_partial)
 
     providers = [
         ProviderConfig(
@@ -164,6 +171,7 @@ def _load_single_file(path: Path) -> AppConfig:
             thinking=p["thinking"],
             context_window=p["context_window"],
             max_output_tokens=p["max_output_tokens"],
+            pricing=p["pricing"],
         )
         for p in validated["providers"]
     ]
@@ -205,6 +213,10 @@ def _load_single_file(path: Path) -> AppConfig:
         teammate_mode=validated["teammate_mode"],
         enable_coordinator_mode=validated["enable_coordinator_mode"],
         sandbox=sandbox_cfg,
+        run_limits=RunLimits(**validated["run_limits"]),
+        _run_limit_fields=set(raw.get("run_limits") or {}),
+        _specified_fields=set(raw),
+        web=validated["web"],
     )
 
 
@@ -226,7 +238,8 @@ def _merge_config(base: AppConfig, override: AppConfig) -> AppConfig:
     base.raw_hooks.extend(override.raw_hooks)
     # enable_fork 默认开着，所以这里不能用「非零即覆盖」那套写法，
     # 否则配置里写 false 会被当成没写，永远关不掉。
-    base.enable_fork = override.enable_fork
+    if override._specified_fields is None or "enable_fork" in override._specified_fields:
+        base.enable_fork = override.enable_fork
     if override.enable_verification_agent:
         base.enable_verification_agent = True
     if override.teammate_mode:
@@ -240,6 +253,9 @@ def _merge_config(base: AppConfig, override: AppConfig) -> AppConfig:
         base.sandbox.auto_allow = True
     if override.sandbox.network_enabled:
         base.sandbox.network_enabled = True
+    for key in override._run_limit_fields:
+        setattr(base.run_limits, key, getattr(override.run_limits, key))
+    base.web.update(override.web)
     return base
 
 
@@ -261,7 +277,7 @@ def load_config(path: Path | None = None) -> AppConfig:
     for p in candidates:
         if not p.exists():
             continue
-        layer = _load_single_file(p)
+        layer = _load_single_file(p, allow_partial=merged is not None)
         if merged is None:
             merged = layer
         else:

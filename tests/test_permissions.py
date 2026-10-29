@@ -497,7 +497,7 @@ async def test_e2e_rule_allows_git():
 
     client = MockLLMClient([
         [
-            ToolCallComplete("t1", "Bash", {"command": "git status"}),
+            ToolCallComplete("t1", "Bash", {"command": "git --version"}),
             StreamEnd("end_turn", input_tokens=10, output_tokens=20),
         ],
         [
@@ -514,7 +514,7 @@ async def test_e2e_rule_allows_git():
     )
     agent = Agent(client, registry, "anthropic", work_dir=str(tmpdir), permission_checker=checker)
     conv = ConversationManager()
-    conv.add_user_message("Show git status")
+    conv.add_user_message("Show git --version")
 
     events = []
     async for e in agent.run(conv):

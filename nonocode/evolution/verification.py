@@ -23,7 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from nonocode.permissions import Decision, PermissionMode
 from nonocode.tools.base import Tool, ToolResult
 
-ENGINE_VERSION = 1
+ENGINE_VERSION = 2
 MAX_FILE_BYTES = 1_000_000
 MAX_INPUT_BYTES = 8_000_000
 _TASK_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
@@ -101,6 +101,7 @@ class TaskSpec(BaseModel):
     repetitions: int = Field(default=2, ge=2, le=3)
     timeout_seconds: int = Field(default=60, ge=1, le=120)
     max_iterations: int = Field(default=8, ge=1, le=20)
+    split: Literal["development", "holdout"] = "development"
 
     @model_validator(mode="after")
     def check_inputs(self):
@@ -127,6 +128,10 @@ class TaskStore:
         if source.stat().st_size > MAX_FILE_BYTES:
             raise ValueError("任务定义过大")
         spec = TaskSpec.model_validate_json(source.read_text(encoding="utf-8"))
+        return self.register_document(spec.model_dump())
+
+    def register_document(self, document: dict) -> dict:
+        spec = TaskSpec.model_validate(document)
         files = {}
         total = 0
         for name in spec.inputs:
@@ -140,7 +145,11 @@ class TaskStore:
             files[name] = base64.b64encode(data).decode("ascii")
         payload = {"spec": spec.model_dump(), "files": files}
         record = {**payload, "fingerprint": digest(payload), "created_at": datetime.now(timezone.utc).isoformat()}
-        atomic_json(self._path(spec.id), record)
+        destination = self._path(spec.id)
+        if destination.exists():
+            previous = self.get(spec.id)
+            atomic_json(self.directory / 'history' / (spec.id+'-'+previous['fingerprint']+'.json'), previous)
+        atomic_json(destination, record)
         return record
 
     def get(self, task_id: str) -> dict:
@@ -236,14 +245,18 @@ def check_artifacts(workspace: Path, checks: list[ArtifactCheck]) -> tuple[list[
 
 
 def candidate_fingerprint(item: dict) -> str:
-    return digest({key: item.get(key, "") for key in ("id", "feedback", "cue", "kind")})
+    return digest({key:item.get(key, '') for key in ('feedback','cue','kind','verification_policy','replaces_id')})
 
 
 def runtime_context(parent, store) -> dict:
     client = parent.client
-    return {"engine": ENGINE_VERSION, "protocol": parent.protocol,
+    from dataclasses import asdict
+    from nonocode.limits import RunLimits
+    from urllib.parse import urlsplit,urlunsplit
+    endpoint=urlsplit(str(getattr(getattr(client,"_client",None),"base_url","")))
+    return {"endpoint_query_hash":hashlib.sha256(endpoint.query.encode()).hexdigest(), "run_limits":asdict(getattr(parent,"run_limits",None) or RunLimits()), "pricing":getattr(getattr(client,"_usage_config",None),"pricing",{}), "engine": ENGINE_VERSION, "protocol": parent.protocol,
             "model": getattr(client, "model", type(client).__name__),
-            "endpoint": str(getattr(getattr(client, "_client", None), "base_url", "")),
+            "endpoint": urlunsplit((endpoint.scheme,endpoint.netloc,endpoint.path,"","")),
             "instructions": parent.instructions_content, "guidance": store.guidance(),
             "context_window": parent.context_window, "tools": ["ReadFile", "WriteFile", "EditFile"]}
 
@@ -286,7 +299,9 @@ class VerificationEngine:
         from nonocode.tools.write_file import WriteFile
 
         spec = TaskSpec.model_validate(record["spec"])
-        result = {"task_id": spec.id, "repeat": repeat, "arm": arm, "completed": False,
+        import time
+        started = time.monotonic()
+        result = {"split": spec.split, "task_id": spec.id, "repeat": repeat, "arm": arm, "completed": False,
                   "error": "", "checks": [], "artifacts": {}, "trace": []}
         with tempfile.TemporaryDirectory(prefix="nonocode-probe-") as temporary:
             workspace = Path(temporary)
@@ -297,7 +312,12 @@ class VerificationEngine:
             registry, cache = ToolRegistry(), FileStateCache()
             for tool in (ReadFile(file_state_cache=cache), WriteFile(file_state_cache=cache), EditFile(file_state_cache=cache)):
                 registry.register(WorkspaceFileTool(tool, workspace))
-            instructions = context["instructions"] + "\n" + context["guidance"]
+            guidance = context['guidance']
+            if arm == 'candidate' and item.get('replaces_id'):
+                previous = self.store.get(item['replaces_id'])
+                line = json.dumps({'rule':previous['feedback'],'when':previous.get('cue',''),'kind':previous.get('kind','preference')},ensure_ascii=False)
+                guidance = guidance.replace('- '+line, '')
+            instructions = context['instructions'] + '\n' + guidance
             if arm == "candidate":
                 instructions += "\nCandidate capability (only when relevant):\n" + json.dumps(
                     {"rule": item["feedback"], "when": item.get("cue", "")}, ensure_ascii=False)
@@ -312,6 +332,10 @@ class VerificationEngine:
 
             async def execute():
                 async for event in agent.run(conversation):
+                    from nonocode.execution import current_execution
+                    execution_scope=current_execution.get()
+                    if execution_scope and execution_scope.run_id!=execution_scope.root_id:
+                        result["tracking_run_id"]=execution_scope.run_id
                     if isinstance(event, ErrorEvent):
                         result["error"] = event.message[:2000]
                     if isinstance(event, LoopComplete):
@@ -332,6 +356,14 @@ class VerificationEngine:
                                                   for call in message.tool_uses],
                                         "results": [{"id": row.tool_use_id, "text": row.content[:4000],
                                                      "is_error": row.is_error} for row in message.tool_results]})
+        result['estimated_cost_usd']=None
+        from nonocode.execution import current_execution
+        execution_scope=current_execution.get()
+        if execution_scope and result.get('tracking_run_id'):
+            with execution_scope.database.connect() as connection:
+                row=connection.execute('SELECT count(*),sum(cost_usd),sum(cost_usd IS NULL) FROM usage_events WHERE run_id=?',(result['tracking_run_id'],)).fetchone()
+            if row[0] and not row[2]:result['estimated_cost_usd']=row[1]
+        result["elapsed"] = time.monotonic()-started
         return result
 
     async def verify(self, candidate_id: str, task_ids: list[str], progress=None) -> dict:
@@ -341,14 +373,21 @@ class VerificationEngine:
         if not 1 <= len(task_ids) <= 3 or len(task_ids) != len(set(task_ids)):
             raise ValueError("一次须指定 1–3 个不同验证任务")
         records = [self.tasks.get(task_id) for task_id in task_ids]
+        policy = item.get('verification_policy','paired-v1')
+        splits = {record['spec'].get('split','development') for record in records}
+        if policy == 'holdout-v1' and splits != {'development','holdout'}:
+            raise ValueError('新能力验证须同时选择 development 与 holdout 任务；保留集不能参与候选改写')
         context = runtime_context(self.parent, self.store)
         # A cancelled or failed recheck must not leave an earlier passing report
         # available for adoption as though the newer attempt had never happened.
         item.pop("verification", None)
         self.store._write(item)
-        report = {"id": uuid.uuid4().hex, "candidate_id": candidate_id,
+        from nonocode.execution import current_execution
+        execution_scope=current_execution.get()
+        report = {"tracking_run_id":execution_scope.root_id if execution_scope else None,"id": uuid.uuid4().hex, "candidate_id": candidate_id,
                   "candidate_fingerprint": candidate_fingerprint(item),
                   "context_fingerprint": digest(context), "runtime": context,
+                  "verification_policy": policy,
                   "tasks": {record["spec"]["id"]: record["fingerprint"] for record in records},
                   "created_at": datetime.now(timezone.utc).isoformat(), "runs": []}
         abort = False
@@ -368,7 +407,12 @@ class VerificationEngine:
                     break
             if abort:
                 break
+        report['holdout_passed'] = any(run.get('split')=='holdout' for run in report['runs']) and all(
+            run['completed'] and not run['error'] and all(check['passed'] for check in run['checks'])
+            for run in report['runs'] if run.get('split')=='holdout' and run['arm']=='candidate')
         report["outcome"], report["reason"] = verdict(report["runs"])
+        if policy=='holdout-v1' and not report['holdout_passed'] and report['outcome']=='passed':
+            report['outcome'],report['reason']='failed','保留集未通过，保留当前版本' 
         report["input_tokens"] = sum(run["input_tokens"] for run in report["runs"])
         report["output_tokens"] = sum(run["output_tokens"] for run in report["runs"])
         atomic_json(self.runs_dir / f"{report['id']}.json", report)
@@ -399,10 +443,12 @@ def require_verified(store, item: dict, context_fingerprint: str) -> dict:
         if not report["tasks"]:
             raise ValueError("报告没有验证任务")
         expected = set()
+        splits = set()
         for task_id, fingerprint in report["tasks"].items():
             record = tasks.get(task_id)
             if record["fingerprint"] != fingerprint:
                 raise ValueError("验证任务已更新")
+            splits.add(record["spec"].get("split","development"))
             for repeat in range(record["spec"]["repetitions"]):
                 for arm in ("baseline", "candidate"):
                     expected.add((task_id, repeat, arm))
@@ -412,6 +458,9 @@ def require_verified(store, item: dict, context_fingerprint: str) -> dict:
                         [row["check"] for row in run["checks"]] != fixed_checks
                         or any(type(row["passed"]) is not bool for row in run["checks"])):
                     raise ValueError("报告中的检查与冻结任务不一致")
+        if item.get('verification_policy')=='holdout-v1':
+            if splits != {'development','holdout'} or report.get('verification_policy')!='holdout-v1' or not report.get('holdout_passed'):
+                raise ValueError('保留集验证缺失或未通过')
         actual = [(run["task_id"], run["repeat"], run["arm"]) for run in report["runs"]]
         if len(actual) != len(expected) or set(actual) != expected or verdict(report["runs"])[0] != "passed":
             raise ValueError("报告未证明持续改善")

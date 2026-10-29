@@ -40,17 +40,31 @@ class EvolutionStore:
         return self.directory / f"{candidate_id}.json"
 
     def _write(self, item: dict) -> None:
+        if self.directory.is_symlink() or self.directory.parent.is_symlink():
+            raise ValueError("拒绝符号链接进化目录")
         self.directory.mkdir(parents=True, exist_ok=True)
         path = self._path(item["id"])
+        versions = self.directory / 'versions' / item['id']
+        if versions.is_symlink() or versions.parent.is_symlink():raise ValueError('拒绝符号链接版本目录')
+        versions.mkdir(parents=True,exist_ok=True)
+        before = json.loads(path.read_text()) if path.exists() else None
+        if before != item:
+            version = {'id':uuid.uuid4().hex,'candidate_id':item['id'],'before':before,'after':item,
+                       'created_at':datetime.now(timezone.utc).isoformat()}
+            history = versions / (version['id']+'.json')
+            fd=os.open(history,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+            with os.fdopen(fd,'w') as output:json.dump(version,output,ensure_ascii=False,indent=2)
         temp = self.directory / f".{uuid.uuid4().hex}.tmp"
         try:
             temp.write_text(json.dumps(item, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            temp.chmod(0o600)
             os.replace(temp, path)
         finally:
             temp.unlink(missing_ok=True)
 
     def create(self, feedback: str, *, source: str = "manual", evidence: str = "",
-               cue: str = "", signal: str = "correction", kind: str = "preference") -> dict:
+               cue: str = "", signal: str = "correction", kind: str = "preference", verification_policy: str = "holdout-v1") -> dict:
+        if verification_policy not in {"paired-v1","holdout-v1"}:raise ValueError("无效验证策略")
         feedback = feedback.strip()
         if not feedback or len(feedback) > _MAX_TEXT:
             raise ValueError(f"反馈须为 1–{_MAX_TEXT} 个字符")
@@ -66,6 +80,8 @@ class EvolutionStore:
                 "observations": ([{"quote": evidence, "signal": signal, "created_at": now}]
                                  if evidence else []),
                 "created_at": now, "updated_at": now}
+        if kind == "capability":
+            item["verification_policy"] = verification_policy
         self._write(item)
         return item
 
@@ -124,6 +140,8 @@ class EvolutionStore:
         if (not isinstance(item.get("kind", "preference"), str)
                 or item.get("kind", "preference") not in {"preference", "capability"}):
             raise ValueError("候选类别无效")
+        if item.get("verification_policy","paired-v1") not in {"paired-v1","holdout-v1"}:
+            raise ValueError("无效验证策略")
         verification = item.get("verification")
         if verification is not None and (not isinstance(verification, dict)
                 or not isinstance(verification.get("run_id"), str)
@@ -201,6 +219,7 @@ class EvolutionStore:
             raise ValueError("只能将待审核或已采纳的普通偏好升级为能力候选")
         item["promoted_from"] = item["status"]
         item["kind"], item["status"] = "capability", "pending"
+        item["verification_policy"] = "holdout-v1"
         item.pop("verification", None)
         item["updated_at"] = datetime.now(timezone.utc).isoformat()
         self._write(item)
@@ -208,6 +227,8 @@ class EvolutionStore:
 
     def guidance(self) -> str:
         items = [item for item in self.list() if item["status"] == "applied"]
+        replaced = {item.get('replaces_id') for item in items}
+        items = [item for item in items if item['id'] not in replaced]
         if not items:
             return ""
         return ("User-approved project guidance (apply only when relevant; "

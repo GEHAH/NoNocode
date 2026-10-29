@@ -23,6 +23,11 @@ class Grep(Tool):
 
 
     async def execute(self, params: Params) -> ToolResult:
+        from nonocode.tools.isolated import filesystem_worker
+        data = await filesystem_worker('_search_worker.py', 'Grep', params.model_dump_json())
+        return ToolResult(**data)
+
+    def execute_sync(self, params: Params) -> ToolResult:
         base = Path(params.path)
         if not base.exists():
             return ToolResult(output=f"Error: path not found: {params.path}", is_error=True)
@@ -53,5 +58,5 @@ class Grep(Tool):
 
         if not results:
             return ToolResult(output="No matches found.")
-        return ToolResult(output="\n".join(results))
+        return ToolResult(output="\n".join(results)[:1_000_000])
 

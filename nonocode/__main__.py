@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import sqlite3
+import zipfile
 import time
 from pathlib import Path
 
@@ -48,16 +49,27 @@ def main() -> None:
         default=False,
         help="Start in remote mode: WebSocket server on localhost:18888 with browser UI",
     )
-    parser.add_argument('--version', action='version', version='NoNocode 0.3.0')
+    parser.add_argument('--version', action='version', version='NoNocode 0.6.0')
     parser.add_argument('--history', nargs='?', const='', default=None, metavar='QUERY', help='Search saved conversations without calling a model')
     parser.add_argument('--runs', action='store_true', help='List persistent task executions')
     parser.add_argument('--doctor', action='store_true', help='Show local diagnostics without exposing API keys')
+    parser.add_argument('--backup', metavar='ARCHIVE.zip', help='Create a recovery bundle without calling a model')
+    parser.add_argument('--restore-backup', metavar='ARCHIVE.zip', help='Restore into a new isolated directory')
+    parser.add_argument('--restore-to', metavar='NEW_DIRECTORY')
+    parser.add_argument('--artifacts',nargs='?',const='',default=None,metavar='QUERY',help='List task artifacts offline')
+    parser.add_argument('--sources',nargs='?',const='',default=None,metavar='QUERY',help='List archived web sources offline')
+    parser.add_argument('--usage',nargs='?',const='',default=None,metavar='ROOT_RUN_ID',help='Show model usage and execution tree offline')
     args = parser.parse_args()
-    if sum((args.p is not None,args.remote,args.history is not None,args.runs,args.doctor)) > 1:
+    if bool(args.restore_backup) != bool(args.restore_to):
+        parser.error('--restore-backup and --restore-to must be used together')
+    if sum((args.p is not None,args.remote,args.history is not None,args.runs,args.doctor,bool(args.backup),bool(args.restore_backup),args.artifacts is not None,args.sources is not None,args.usage is not None)) > 1:
         parser.error('choose one of -p, --remote, --history, --runs, --doctor')
-    if args.history is not None or args.runs or args.doctor:
+    if args.history is not None or args.runs or args.doctor or args.backup or args.restore_backup or args.artifacts is not None or args.sources is not None or args.usage is not None:
         from nonocode.offline import run_offline
-        run_offline(args)
+        try:
+            run_offline(args)
+        except (ValueError, OSError, sqlite3.Error, zipfile.BadZipFile, KeyError) as exc:
+            parser.exit(1, f"NoNocode: {exc}\n")
         return
 
     # 先确保 .nonocode/ 目录存在，否则下面写 debug.log 会因目录不存在而崩溃
@@ -127,6 +139,8 @@ def main() -> None:
         enable_coordinator_mode=config.enable_coordinator_mode,
         driver_class=NoAltScreenDriver,
         sandbox_config=config.sandbox,
+        run_limits=getattr(config, "run_limits", None),
+        web_config=config.web,
     )
     app.run()
 
@@ -196,7 +210,7 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
     )
 
     instructions = load_instructions(work_dir)
-    registry = create_default_registry()
+    registry = create_default_registry(web_config=getattr(config, "web", {}))
     registry.register(ToolSearchTool(registry, protocol=provider.protocol))
 
     agent = Agent(
@@ -204,6 +218,7 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
         registry=registry,
         protocol=provider.protocol,
         work_dir=work_dir,
+        run_limits=getattr(config, "run_limits", None),
         permission_checker=checker,
         context_window=provider.get_context_window(),
         instructions_content=instructions,
@@ -291,6 +306,7 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
     tool_calls: list[dict] = []
 
     tracked_events = run.events(agent.run(conv))
+    execution_error = False
     try:
         async for event in tracked_events:
             if isinstance(event, StreamText):
@@ -303,7 +319,7 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
                     emit_json({"type": "thinking", "text": event.text})
 
             elif isinstance(event, ToolUseEvent):
-                tool_calls.append({"name": event.tool_name, "is_error": False})
+                tool_calls.append({"name": event.tool_name, "tool_id": event.tool_id, "is_error": False})
                 if is_json:
                     emit_json({
                         "type": "tool_use",
@@ -314,8 +330,10 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
 
             elif isinstance(event, ToolResultEvent):
                 # 回填最后一个同名 tool_call 的 is_error
-                if tool_calls:
-                    tool_calls[-1]["is_error"] = event.is_error
+                for call in reversed(tool_calls):
+                    if call["tool_id"] == event.tool_id:
+                        call["is_error"] = event.is_error
+                        break
                 if is_json:
                     emit_json({
                         "type": "tool_result",
@@ -342,6 +360,8 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
                     emit_json({"type": "turn_complete", "turn": event.turn})
 
             elif isinstance(event, LoopComplete):
+                if execution_error:
+                    break
                 history_cursor = session.append_new_messages(conv.history,history_cursor)
                 # 最终结果：stream-json 输出 result 行，text 模式直接打印文本
                 elapsed_ms = int((time.monotonic() - start) * 1000)
@@ -365,6 +385,7 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
                 break
 
             elif isinstance(event, ErrorEvent):
+                execution_error = True
                 if is_json:
                     emit_json({"type": "error", "message": event.message})
                 else:
@@ -386,7 +407,7 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str, output_
                 # -p 非交互模式：自动批准所有权限请求
                 event.future.set_result(PermissionResponse.ALLOW)
 
-        if not run.finished:
+        if execution_error or not run.finished:
             # A terminal ErrorEvent must also be visible to shell callers.
             await tracked_events.aclose()
             raise SystemExit(1)
@@ -461,6 +482,7 @@ async def _build_teammate_registry(
     team_name: str,
     agent_name: str,
     mcp_servers: list,
+    web_config: dict | None = None,
 ):
     """组装队友工具集。
 
@@ -487,7 +509,7 @@ async def _build_teammate_registry(
     from nonocode.tools.task_update import TaskUpdateTool
     from nonocode.worktree import WorktreeManager
 
-    registry = create_default_registry()
+    registry = create_default_registry(web_config=web_config)
     registry.register(ToolSearchTool(registry, protocol=protocol))
     registry.register(SyntheticOutputTool())
 
@@ -593,6 +615,7 @@ async def _run_teammate(team_name: str, agent_name: str) -> None:
         team_name=team_name,
         agent_name=agent_name,
         mcp_servers=config.mcp_servers,
+        web_config=config.web,
     )
 
     checker = PermissionChecker(
@@ -607,6 +630,7 @@ async def _run_teammate(team_name: str, agent_name: str) -> None:
         registry=registry,
         protocol=provider.protocol,
         work_dir=work_dir,
+        run_limits=getattr(config, "run_limits", None),
         permission_checker=checker,
         context_window=provider.get_context_window(),
         instructions_content=load_instructions(work_dir),

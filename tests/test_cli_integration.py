@@ -118,10 +118,10 @@ def test_cli_offline_history_and_doctor_without_api_configuration(tmp_path):
     doctor = run_cli(tmp_path,['--doctor'])
     assert doctor.returncode == 0,doctor.stderr
     result = json.loads(doctor.stdout)
-    assert result['version'] == '0.3.0'
+    assert result['version'] == '0.6.0'
     assert 'configuration' in result
     version = run_cli(tmp_path,['--version'])
-    assert version.returncode == 0 and version.stdout.strip() == 'NoNocode 0.3.0'
+    assert version.returncode == 0 and version.stdout.strip() == 'NoNocode 0.6.0'
 
 
 def test_cli_saves_history_and_task_for_later_offline_lookup(tmp_path, local_anthropic):

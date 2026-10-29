@@ -28,3 +28,33 @@ mcp_servers:
   #     Authorization: "Bearer ${MY_TOKEN}"
 
 enable_coordinator_mode: false   # 设为 true 后创建 Team 时 Lead 只能调度不能写代码
+
+# Per-invocation limits. 0 explicitly disables a limit.
+run_limits:
+  max_seconds: 900
+  max_iterations: 50
+  max_tool_calls: 100
+  max_tokens: 200000
+  max_repeated_calls: 4
+  max_daily_tokens: 1000000
+  max_cost_usd: 0
+  max_daily_cost_usd: 0
+  budget_timezone: Asia/Shanghai
+
+# Built-in public web tools, available in TUI, -p and --remote.
+web:
+  enabled: true
+  search_provider: bing  # Public RSS, no key; availability/quality can vary.
+  # For an authenticated search API:
+  # search_provider: brave
+  # search_api_key_env: BRAVE_SEARCH_API_KEY
+
+# Optional per-provider pricing, in USD per million tokens.
+# Add pricing under a provider, using verified prices and the pricing date:
+# pricing:
+#   input_per_million: <nonnegative number>
+#   output_per_million: <nonnegative number>
+#   cache_read_per_million: <optional nonnegative number>
+#   cache_creation_per_million: <optional nonnegative number>
+#   as_of: "YYYY-MM-DD"
+# Cost limits require prices. Costs are estimates, not provider billing totals.

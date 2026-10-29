@@ -30,7 +30,7 @@ def test_database_is_local_and_configurable(tmp_path, monkeypatch):
     assert database.path == tmp_path/'custom/nonocode.db'
     with database.connect() as connection:
         assert connection.execute('PRAGMA journal_mode').fetchone()[0] == preferred_journal_mode()
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == 1
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == 2
 
 
 def test_future_database_schema_is_not_downgraded(tmp_path):

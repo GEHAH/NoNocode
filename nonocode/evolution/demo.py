@@ -59,7 +59,7 @@ async def run_demo(output: Path) -> dict:
     atomic_json(output / "regression.json", regression)
     TaskStore(str(output)).register("regression.json")
     store = EvolutionStore(str(output))
-    candidate = store.create(RULE, kind="capability", cue="Signed ledger calculations")
+    candidate = store.create(RULE, kind="capability", verification_policy="paired-v1", cue="Signed ledger calculations")
     parent = SimpleNamespace(client=DemoClient(), protocol="openai-compat", work_dir=str(output),
                              instructions_content="", context_window=128000)
     report = await VerificationEngine(parent, store).verify(candidate["id"], ["signed-ledger", "positive-ledger"])

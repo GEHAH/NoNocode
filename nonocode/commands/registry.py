@@ -107,5 +107,7 @@ def requires_idle(command: Command, args: str) -> bool:
     sub = args.split(maxsplit=1)[0] if args.strip() else ''
     return (command.name == 'session' and sub in {'new','resume','delete','rename'}
             or command.name == 'memory' and sub in {'clear','update','add','forget'}
+            or command.name == 'storage' and sub == 'backup-full'
+            or command.name == 'settings' and sub in {'save','test'}
             or command.name == 'rewind' and bool(args.strip())
             or command.name in {'permission','sandbox','skill'} and bool(args.strip()))

@@ -198,7 +198,7 @@ class TestValidator:
                 {
                     "name": "p",
                     "protocol": "anthropic",
-                    "base_url": "u",
+                    "base_url": "https://example.com",
                     "model": "claude-sonnet-4-6",
                 }
             ]
@@ -212,7 +212,7 @@ class TestValidator:
                 {
                     "name": "p",
                     "protocol": "anthropic",
-                    "base_url": "u",
+                    "base_url": "https://example.com",
                     "model": "claude-sonnet-4-6",
                     "context_window": 50_000,
                 }
@@ -228,7 +228,7 @@ class TestValidator:
                     {
                         "name": "p",
                         "protocol": "anthropic",
-                        "base_url": "u",
+                        "base_url": "https://example.com",
                         "model": "claude-sonnet-4-6",
                         "context_window": bad,
                     }

@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import uuid
+import re
 from typing import Iterator
 
 
@@ -43,7 +45,7 @@ class Database:
         self.workspace_id = hashlib.sha256(self.workspace_path.encode()).hexdigest()
         with self.connect() as connection:
             version = connection.execute('PRAGMA user_version').fetchone()[0]
-            if version > 1:
+            if version > 2:
                 raise RuntimeError('数据库版本比当前程序更新，请升级 NoNocode')
             self.journal_mode = connection.execute('PRAGMA journal_mode='+preferred_journal_mode()).fetchone()[0]
             connection.executescript('''
@@ -78,7 +80,6 @@ class Database:
                     type TEXT NOT NULL, description TEXT NOT NULL, body TEXT NOT NULL,
                     path TEXT NOT NULL, updated_at TEXT NOT NULL,
                     PRIMARY KEY(workspace_id,scope,name));
-                PRAGMA user_version=1;
             ''')
             connection.execute('INSERT OR IGNORE INTO workspaces VALUES(?,?,?)',
                                (self.workspace_id, self.workspace_path, now()))
@@ -97,6 +98,9 @@ class Database:
                 self.fts = True
             except sqlite3.OperationalError:
                 self.fts = False
+        from nonocode.storage.schema import migrate, workspace_identity
+        migrate(self)
+        self.workspace_id = workspace_identity(self)
         try:
             self.path.chmod(0o600)
         except OSError:

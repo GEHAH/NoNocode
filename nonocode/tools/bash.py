@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import re
+import os
+import signal
 import shlex
 from typing import TYPE_CHECKING
 
@@ -23,7 +25,6 @@ _COMMAND_ERROR_THRESHOLDS: dict[str, int] = {
     "fgrep": 2,
     "rg": 2,     # ripgrep，与 grep 语义一致
     "diff": 2,   # exit 1 = 文件内容有差异
-    "find": 2,   # exit 1 = 部分成功（如权限不足跳过某些目录）
     "test": 2,   # exit 1 = 条件为假
     "[": 2,      # test 的别名形式
 }
@@ -66,6 +67,8 @@ def _interpret_exit_code(command: str, exit_code: int) -> bool:
     """
     if exit_code == 0:
         return False
+    if exit_code < 0 or re.search(r"[;&\n\r]|\|\||`|\$\(", command):
+        return True
 
     cmd_name = _extract_last_command_name(command)
     if cmd_name and cmd_name in _COMMAND_ERROR_THRESHOLDS:
@@ -105,7 +108,7 @@ def _exit_code_hint(command: str, exit_code: int) -> str:
 
 class Params(BaseModel):
     command: str = Field(description="Shell command to execute")
-    timeout: int = Field(default=120, description="Timeout in seconds (max 600)")
+    timeout: int = Field(default=120, ge=1, le=MAX_TIMEOUT, description="Timeout in seconds (max 600)")
 
 
 class Bash(Tool):
@@ -129,26 +132,32 @@ class Bash(Tool):
         if self.sandbox and self.sandbox_config and self.sandbox.available():
             actual_command = self.sandbox.wrap(params.command, self.sandbox_config)
 
+        proc = None
+        spawn = asyncio.create_task(asyncio.create_subprocess_shell(
+            actual_command, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT, cwd=self.work_dir,
+            start_new_session=(os.name == "posix"),
+        ))
         try:
-            proc = await asyncio.create_subprocess_shell(
-                actual_command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,  # 合并 stderr 到 stdout
-                cwd=self.work_dir,
-            )
+            # Shield creation so cancellation cannot lose the newly created process.
+            proc = await asyncio.shield(spawn)
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.CancelledError:
+            if proc is None:
+                proc = await spawn
+            await self._stop_process(proc)
+            raise
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+            await self._stop_process(proc)
             return ToolResult(output=f"Error: command timed out after {timeout}s", is_error=True)
         except Exception as e:
+            if proc is not None:
+                await self._stop_process(proc)
             return ToolResult(output=f"Error executing command: {e}", is_error=True)
 
         # 合并流输出，不再区分 stdout/stderr
         output = stdout.decode(errors="replace") if stdout else ""
 
-        # 非零退出码时追加退出码信息，但 is_error 始终为 False
-        # 只有超时和异常才设置 is_error=True
         exit_code = proc.returncode or 0
         if exit_code != 0:
             hint = _exit_code_hint(params.command, exit_code)
@@ -160,5 +169,31 @@ class Bash(Tool):
         if not output:
             output = "(no output)"
 
-        return ToolResult(output=output, is_error=False)
+        return ToolResult(output=output, is_error=_interpret_exit_code(params.command, exit_code))
 
+
+    @staticmethod
+    async def _stop_process(proc) -> None:
+        if proc is None:
+            return
+        try:
+            if os.name == "posix":
+                os.killpg(proc.pid, signal.SIGTERM)
+            elif proc.returncode is None:
+                proc.terminate()
+        except ProcessLookupError:
+            pass
+        # Even when the shell exits first, descendants can still own the pipe.
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=0.5)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            try:
+                if os.name == "posix":
+                    os.killpg(proc.pid, signal.SIGKILL)
+                elif proc.returncode is None:
+                    proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.communicate()

@@ -122,7 +122,7 @@ class PermissionChecker:
             return Decision(effect="allow", reason="OS 沙箱自动放行")
 
         # Layer 2: 路径沙箱（仅文件类工具）
-        if tool.category in ("read", "write") and content:
+        if tool.category in ("read", "write") and content and tool.name not in {"WebSearch", "WebFetch"}:
             ok, reason = self.sandbox.check(content)
             if not ok and self.mode != PermissionMode.BYPASS:
                 return Decision(effect="ask", reason=f"路径沙箱拦截: {reason}")

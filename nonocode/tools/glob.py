@@ -21,6 +21,11 @@ class Glob(Tool):
 
 
     async def execute(self, params: Params) -> ToolResult:
+        from nonocode.tools.isolated import filesystem_worker
+        data = await filesystem_worker('_search_worker.py', 'Glob', params.model_dump_json())
+        return ToolResult(**data)
+
+    def execute_sync(self, params: Params) -> ToolResult:
         base = Path(params.path)
         if not base.exists():
             return ToolResult(output=f"Error: path not found: {params.path}", is_error=True)
@@ -38,5 +43,5 @@ class Glob(Tool):
 
         if not matches:
             return ToolResult(output="No files matched the pattern.")
-        return ToolResult(output="\n".join(matches))
+        return ToolResult(output="\n".join(matches)[:1_000_000])
 
